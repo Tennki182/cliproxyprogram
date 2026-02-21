@@ -25,4 +25,4 @@ if [ -d "/app/public" ]; then
 fi
 
 # Switch to app user and execute the main command
-exec su-exec app "$@"
+exec gosu app "$@"

@@ -21,9 +21,9 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# Install su-exec for switching users in entrypoint
+# Install gosu for switching users in entrypoint
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    su-exec \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install production node_modules (sql.js is pure WASM, no native tools needed)
