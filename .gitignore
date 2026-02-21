@@ -11,10 +11,12 @@ dist/
 *.local
 
 # Runtime data
-data/*.db
-data/*.log
+data/
 *.log
 npm-debug.log*
+
+# Config (use config.yaml.example as template)
+config.yaml
 
 # Cache
 cliproxy_tree.json
