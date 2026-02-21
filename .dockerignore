@@ -1,0 +1,10 @@
+node_modules
+dist
+.tmp
+browsers
+data
+.git
+.gitignore
+.env
+*.log
+docker-compose*.yml

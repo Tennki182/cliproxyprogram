@@ -21,6 +21,7 @@ config.yaml
 # Cache
 cliproxy_tree.json
 codex_tree.json
+*.cache
 
 # IDE
 .idea/
@@ -33,11 +34,8 @@ codex_tree.json
 .DS_Store
 Thumbs.db
 
-# Docs
-docs/
-
-# Claude AI
+# Claude AI local session data
 .claude/
 
-# Docker
-.dockerignore
+# Test coverage
+coverage/
