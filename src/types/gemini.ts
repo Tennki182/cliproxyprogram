@@ -73,24 +73,8 @@ export interface GeminiGenerateContentRequest {
   safetySettings?: unknown[];
 }
 
-export interface GeminiCandidate {
-  content: GeminiContent;
-  finishReason: 'STOP' | 'MAX_TOKENS' | 'SAFETY' | 'RECITATION' | 'OTHER' | null;
-  index: number;
-  safetyRatings?: unknown[];
-}
-
-export interface GeminiGenerateContentResponse {
-  candidates: GeminiCandidate[];
-  promptFeedback?: {
-    safetyRatings?: unknown[];
-  };
-  usageMetadata?: {
-    promptTokenCount: number;
-    candidatesTokenCount: number;
-    totalTokenCount: number;
-  };
-}
+// Loose response type — Gemini API responses vary between backends
+export type GeminiResponse = any;
 
 export interface GeminiModelInfo {
   name: string;

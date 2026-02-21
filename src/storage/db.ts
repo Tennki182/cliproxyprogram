@@ -40,7 +40,7 @@ function initializeTables(): void {
   database.run(`
     CREATE TABLE IF NOT EXISTS credentials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      account_id TEXT UNIQUE NOT NULL,
+      account_id TEXT NOT NULL,
       access_token TEXT NOT NULL,
       refresh_token TEXT,
       expires_at INTEGER,
@@ -49,6 +49,75 @@ function initializeTables(): void {
       updated_at INTEGER DEFAULT (strftime('%s', 'now'))
     )
   `);
+
+  // Add project_id column if not exists (migration for existing databases)
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN project_id TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add rotation columns if not exists
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN last_used_at INTEGER DEFAULT 0`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN rate_limited_until INTEGER DEFAULT 0`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add provider and proxy_url columns
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN provider TEXT DEFAULT 'gemini'`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN proxy_url TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Migrate: drop old UNIQUE(account_id) constraint by rebuilding table.
+  // SQLite inline UNIQUE cannot be dropped, must recreate table.
+  try {
+    // Check if old UNIQUE(account_id) constraint exists by inspecting table SQL
+    const tableInfo = database.exec(`SELECT sql FROM sqlite_master WHERE type='table' AND name='credentials'`);
+    const createSql = tableInfo[0]?.values[0]?.[0] as string || '';
+    if (createSql.includes('account_id TEXT UNIQUE') || createSql.includes('account_id" TEXT UNIQUE')) {
+      database.run(`CREATE TABLE IF NOT EXISTS credentials_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        expires_at INTEGER,
+        scope TEXT,
+        project_id TEXT,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        last_used_at INTEGER DEFAULT 0,
+        rate_limited_until INTEGER DEFAULT 0,
+        provider TEXT DEFAULT 'gemini',
+        proxy_url TEXT
+      )`);
+      database.run(`INSERT OR IGNORE INTO credentials_new
+        (id, account_id, access_token, refresh_token, expires_at, scope, project_id,
+         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url)
+        SELECT id, account_id, access_token, refresh_token, expires_at, scope, project_id,
+         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url
+        FROM credentials`);
+      database.run(`DROP TABLE credentials`);
+      database.run(`ALTER TABLE credentials_new RENAME TO credentials`);
+    }
+  } catch { /* migration not needed or already done */ }
+
+  // Ensure composite unique index exists
+  try {
+    database.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_account_provider ON credentials(account_id, provider)`);
+  } catch { /* index already exists */ }
 
   // Sessions table for chat history
   database.run(`

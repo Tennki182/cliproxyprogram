@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment
+.env
+.env.local
+.env.*
+*.local
+
+# Runtime data
+data/*.db
+data/*.log
+*.log
+npm-debug.log*
+
+# Cache
+cliproxy_tree.json
+codex_tree.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (local only)
+docs/
+AGENTS.md
+CLAUDE.md
+CHANGES.md
+
+# Claude AI
+.claude/
+
+# Docker
+.dockerignore

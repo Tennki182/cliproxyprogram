@@ -98,6 +98,8 @@ export interface OpenAIModel {
   object: 'model';
   created: number;
   owned_by: string;
+  x_provider?: string;
+  x_excluded?: boolean;
 }
 
 export interface OpenAIModelList {

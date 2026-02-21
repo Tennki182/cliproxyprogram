@@ -1,83 +1,102 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { getConfig } from '../config.js';
 
+/** Routes that require no auth at all */
+const NO_AUTH_PATHS = [
+  '/health',
+  '/auth/login',
+  '/auth/callback',
+  '/auth/codex/login',
+  '/auth/codex/callback',
+  '/auth/iflow/login',
+  '/auth/iflow/callback',
+  '/auth/verify',
+];
+
+/** Check if the path is an API route (clients calling the proxy) */
+function isApiRoute(path: string): boolean {
+  if (path.startsWith('/v1beta/')) return true;
+  if (path.startsWith('/v1/')) return true;
+  return false;
+}
+
 /**
- * Password authentication middleware
+ * Extract auth token from the request.
+ * Supports:
+ *   - Authorization: Bearer <token>      (OpenAI / general)
+ *   - Authorization: Basic <base64>      (user:password → extracts password)
+ *   - x-api-key: <token>                 (Anthropic / Claude Code)
+ *   - ?key=<token>                       (Gemini SDK)
+ */
+function extractToken(request: FastifyRequest): string | null {
+  // 1. x-api-key header (Anthropic SDK / Claude Code)
+  const xApiKey = request.headers['x-api-key'];
+  if (typeof xApiKey === 'string' && xApiKey) return xApiKey;
+
+  // 2. Authorization header
+  const authHeader = request.headers.authorization;
+  if (authHeader) {
+    if (authHeader.startsWith('Bearer ')) {
+      return authHeader.slice(7);
+    }
+    if (authHeader.startsWith('Basic ')) {
+      const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
+      const colonIndex = decoded.indexOf(':');
+      if (colonIndex !== -1) return decoded.slice(colonIndex + 1);
+    }
+  }
+
+  // 3. ?key= query parameter (Gemini SDK)
+  const url = new URL(request.url, 'http://localhost');
+  const keyParam = url.searchParams.get('key');
+  if (keyParam) return keyParam;
+
+  return null;
+}
+
+function sendUnauthorized(reply: FastifyReply, message: string, code: string): void {
+  reply.status(401).send({
+    error: { message, type: 'authentication_error', code },
+  });
+}
+
+/**
+ * Authentication middleware — supports all three API formats.
  */
 export async function authMiddleware(
   request: FastifyRequest,
   reply: FastifyReply
 ): Promise<void> {
-  // Skip auth for certain paths
-  const skipPaths = [
-    '/',
-    '/health',
-    '/v1/models',
-    '/auth/device',
-    '/auth/status',
-  ];
+  const urlPath = request.url.split('?')[0];
 
-  if (skipPaths.some(path => request.url.startsWith(path))) {
-    return;
-  }
+  // No auth needed
+  if (NO_AUTH_PATHS.some(p => p === urlPath || (p !== '/' && urlPath.startsWith(p + '/')))) return;
+  if (urlPath === '/') return;
+  if (urlPath.startsWith('/admin')) return;
+  if (urlPath.startsWith('/v0/management')) return; // management routes have their own auth
 
-  // Check for password
   const config = getConfig();
-  const authHeader = request.headers.authorization;
+  const token = extractToken(request);
 
-  if (!authHeader) {
-    return reply.status(401).send({
-      error: {
-        message: 'Missing authorization header',
-        type: 'authentication_error',
-        code: 'missing_authorization',
-      },
-    });
-  }
-
-  // Basic auth format: "Basic base64(username:password)"
-  if (authHeader.startsWith('Basic ')) {
-    const base64Credentials = authHeader.slice(6);
-    const credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
-    const [, password] = credentials.split(':');
-
-    if (password !== config.auth.password) {
-      return reply.status(401).send({
-        error: {
-          message: 'Invalid credentials',
-          type: 'authentication_error',
-          code: 'invalid_credentials',
-        },
-      });
+  if (isApiRoute(urlPath)) {
+    // API routes — check apiKey (empty apiKey = no auth required)
+    if (!config.auth.apiKey) return;
+    if (!token) {
+      return sendUnauthorized(reply, 'Missing authentication', 'missing_authorization');
     }
-
-    return;
-  }
-
-  // Bearer token format (could be API key)
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7);
-
-    if (token !== config.auth.password) {
-      return reply.status(401).send({
-        error: {
-          message: 'Invalid token',
-          type: 'authentication_error',
-          code: 'invalid_token',
-        },
-      });
+    if (token !== config.auth.apiKey) {
+      return sendUnauthorized(reply, 'Invalid API key', 'invalid_api_key');
     }
-
-    return;
+  } else {
+    // Admin/auth routes — check loginSecret (empty loginSecret = no auth required)
+    if (!config.auth.loginSecret) return;
+    if (!token) {
+      return sendUnauthorized(reply, 'Missing authentication', 'missing_authorization');
+    }
+    if (token !== config.auth.loginSecret) {
+      return sendUnauthorized(reply, 'Invalid login secret', 'invalid_secret');
+    }
   }
-
-  return reply.status(401).send({
-    error: {
-      message: 'Invalid authorization format',
-      type: 'authentication_error',
-      code: 'invalid_authorization_format',
-    },
-  });
 }
 
 /**

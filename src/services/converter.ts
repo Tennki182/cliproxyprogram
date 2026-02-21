@@ -10,17 +10,22 @@ import {
   GeminiFunctionDeclaration,
   GeminiTool,
   GeminiToolConfig,
-  GeminiFunctionCallPart,
   GeminiFunctionResponsePart,
 } from '../types/gemini.js';
+
+export interface ConvertOptions {
+  includeThoughtSignature?: boolean;
+}
 
 /**
  * Convert OpenAI messages to Gemini contents format
  */
 export function convertMessagesToContents(
-  messages: OpenAIMessage[]
+  messages: OpenAIMessage[],
+  options?: ConvertOptions
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
+  const includeThought = options?.includeThoughtSignature ?? true;
 
   for (const msg of messages) {
     // Skip system messages - Gemini uses systemInstruction separately
@@ -32,27 +37,37 @@ export function convertMessagesToContents(
         parts: [{ text: msg.content }],
       });
     } else if (msg.role === 'assistant') {
-      const parts: GeminiFunctionCallPart[] = [];
+      const parts: any[] = [];
 
       if (msg.content) {
-        parts.push({ text: msg.content } as any);
+        parts.push({ text: msg.content });
       }
 
-      // Handle tool calls
+      // Handle tool calls - add thoughtSignature for cloudcode-pa API
       if ((msg as any).tool_calls) {
         for (const toolCall of (msg as any).tool_calls) {
-          parts.push({
+          let args: Record<string, unknown> = {};
+          try {
+            args = JSON.parse(toolCall.function.arguments);
+          } catch {
+            args = {};
+          }
+          const part: any = {
             functionCall: {
               name: toolCall.function.name,
-              args: JSON.parse(toolCall.function.arguments),
+              args,
             },
-          });
+          };
+          if (includeThought) {
+            part.thoughtSignature = 'skip_thought_signature_validator';
+          }
+          parts.push(part);
         }
       }
 
       contents.push({
         role: 'model',
-        parts: parts as any,
+        parts,
       });
     } else if (msg.role === 'tool') {
       contents.push({
@@ -134,8 +149,8 @@ export function convertToolsToGemini(
       functionDeclarations.push({
         name: tool.function.name,
         description: tool.function.description || '',
-        parameters: cleanSchemaForGemini(tool.function.parameters),
-      });
+        parametersJsonSchema: cleanSchemaForGemini(tool.function.parameters),
+      } as any);
     }
   }
 

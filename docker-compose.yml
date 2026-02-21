@@ -3,18 +3,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: proxycli:latest
     container_name: proxycli
     ports:
-      - "3000:3000"
+      - "8488:8488"
+    volumes:
+      # Persistent database + session files
+      - ./data:/app/data
+      # Config file (edit on host, read-only inside container)
+      - ./config.yaml:/app/config.yaml:ro
     environment:
       - NODE_ENV=production
-    volumes:
-      - ./data:/app/data
-      - ./config.yaml:/app/config.yaml:ro
+      - TZ=Asia/Shanghai
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:8488/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s

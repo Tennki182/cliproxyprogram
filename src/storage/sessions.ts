@@ -1,5 +1,6 @@
 import { getDatabase, saveDatabase } from './db.js';
 import { OpenAIMessage } from '../types/openai.js';
+import { rowToObject, rowsToObjects, nowSeconds } from './utils.js';
 
 export interface Session {
   id?: number;
@@ -12,7 +13,7 @@ export interface Session {
 
 export function createSession(sessionId: string, accountId: string): Session {
   const db = getDatabase();
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowSeconds();
 
   const session: Session = {
     session_id: sessionId,
@@ -40,19 +41,7 @@ export function getSession(sessionId: string): Session | null {
     [sessionId]
   );
 
-  if (result.length === 0 || result[0].values.length === 0) {
-    return null;
-  }
-
-  const columns = result[0].columns;
-  const values = result[0].values[0];
-
-  const session: Record<string, unknown> = {};
-  columns.forEach((col: string, i: number) => {
-    session[col] = values[i];
-  });
-
-  return session as unknown as Session;
+  return rowToObject<Session>(result);
 }
 
 export function getSessionMessages(sessionId: string): OpenAIMessage[] {
@@ -71,7 +60,7 @@ export function getSessionMessages(sessionId: string): OpenAIMessage[] {
 
 export function saveSessionMessages(sessionId: string, messages: OpenAIMessage[]): void {
   const db = getDatabase();
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowSeconds();
 
   const messagesJson = JSON.stringify(messages);
 
@@ -104,18 +93,5 @@ export function getAccountSessions(accountId: string): Session[] {
     [accountId]
   );
 
-  if (result.length === 0) {
-    return [];
-  }
-
-  const columns = result[0].columns;
-  const values = result[0].values;
-
-  return values.map((row: unknown[]) => {
-    const session: Record<string, unknown> = {};
-    columns.forEach((col: string, i: number) => {
-      session[col] = row[i];
-    });
-    return session as unknown as Session;
-  });
+  return rowsToObjects<Session>(result);
 }

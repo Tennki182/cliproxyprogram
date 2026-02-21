@@ -1,13 +1,13 @@
 import { FastifyInstance } from 'fastify';
 import { OpenAIModelList, OpenAIModel } from '../types/openai.js';
-import { getConfig } from '../config.js';
+import { listAllModels, resolveModelAlias, getProviderForModel, parseModelWithPrefix } from '../services/models.js';
 
 export async function modelRoutes(fastify: FastifyInstance): Promise<void> {
   /**
    * GET /v1/models - List available models
    */
   fastify.get<{
-    Querystring: { prefix?: string };
+    Querystring: { prefix?: string; include_excluded?: string };
   }>(
     '/v1/models',
     {
@@ -16,20 +16,25 @@ export async function modelRoutes(fastify: FastifyInstance): Promise<void> {
           type: 'object',
           properties: {
             prefix: { type: 'string' },
+            include_excluded: { type: 'string' },
           },
         },
       },
     },
     async (request, _reply) => {
-      const config = getConfig();
-      const { prefix } = request.query;
+      const { prefix, include_excluded } = request.query;
+      const includeExcluded = include_excluded === 'true';
 
-      const models: OpenAIModel[] = config.gemini.supportedModels.map(
-        (modelName, index) => ({
-          id: modelName,
-          object: 'model',
+      const allModels = listAllModels({ includeExcluded });
+
+      const models: OpenAIModel[] = allModels.map(
+        (m, index) => ({
+          id: m.id,
+          object: 'model' as const,
           created: 1700000000 + index,
-          owned_by: 'google',
+          owned_by: m.owned_by,
+          x_provider: m.provider,
+          ...(m.excluded ? { x_excluded: true } : {}),
         })
       );
 
@@ -48,28 +53,34 @@ export async function modelRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   /**
-   * GET /v1/models/:id - Get model information
+   * GET /v1/models/* - Get model information (supports provider/model prefix)
    */
-  fastify.get<{
-    Params: { id: string };
-  }>(
-    '/v1/models/:id',
-    {
-      schema: {
-        params: {
-          type: 'object',
-          required: ['id'],
-          properties: {
-            id: { type: 'string' },
-          },
-        },
-      },
-    },
+  fastify.get(
+    '/v1/models/*',
     async (request, reply) => {
-      const config = getConfig();
-      const { id } = request.params;
+      const id = (request.params as Record<string, string>)['*'];
+      if (!id) {
+        return reply.status(400).send({
+          error: {
+            message: 'Missing model ID',
+            type: 'invalid_request_error',
+            code: 'missing_model_id',
+          },
+        });
+      }
 
-      if (!config.gemini.supportedModels.includes(id)) {
+      const parsed = parseModelWithPrefix(id);
+      let providerName: string | null;
+      let displayId = id;
+
+      if (parsed) {
+        providerName = parsed.provider;
+      } else {
+        const resolved = resolveModelAlias(id);
+        providerName = getProviderForModel(resolved);
+      }
+
+      if (!providerName) {
         return reply.status(404).send({
           error: {
             message: `Model '${id}' not found`,
@@ -79,12 +90,17 @@ export async function modelRoutes(fastify: FastifyInstance): Promise<void> {
         });
       }
 
-      const modelIndex = config.gemini.supportedModels.indexOf(id);
+      const owned_by = providerName === 'gemini' ? 'google'
+        : providerName === 'codex' ? 'openai'
+        : providerName === 'iflow' ? 'iflow'
+        : 'unknown';
+
       const model: OpenAIModel = {
-        id,
+        id: displayId,
         object: 'model',
-        created: 1700000000 + modelIndex,
-        owned_by: 'google',
+        created: 1700000000,
+        owned_by,
+        x_provider: providerName,
       };
 
       return model;

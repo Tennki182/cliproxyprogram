@@ -1,54 +1,46 @@
-FROM node:22-slim AS base
-
-ENV NODE_ENV=production \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# sql.js uses WASM so no native build tools needed at runtime,
+# but TypeScript compilation may pull in packages that do.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    make \
-    g++ \
-    libc-dev \
+    python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package files
 COPY package.json package-lock.json* ./
+RUN npm ci
 
-# Install dependencies
-RUN npm ci --only=production
-
-# Copy source code
-COPY . .
-
-# Build TypeScript
+COPY tsconfig.json ./
+COPY src/ ./src/
 RUN npm run build
 
-# Production stage
-FROM node:22-slim AS production
+# ── Production stage ──────────────────────────────────────────────────────────
+FROM node:22-slim
 
 WORKDIR /app
 
-# Create non-root user
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 app
+# Install production node_modules (sql.js is pure WASM, no native tools needed)
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev --omit=optional
 
-# Copy built files
-COPY --from=base /app/dist ./dist
-COPY --from=base /app/node_modules ./node_modules
-COPY --from=base /app/package.json ./package.json
-COPY --from=base /app/config.yaml ./
+# Copy built assets
+COPY --from=builder /app/dist ./dist/
+COPY public/ ./public/
 
-# Create data directory
-RUN mkdir -p /app/data
-
-# Change ownership
-RUN chown -R app:nodejs /app
+# Non-root user
+RUN addgroup --system --gid 1001 nodejs \
+    && adduser --system --uid 1001 app \
+    && mkdir -p /app/data \
+    && chown -R app:nodejs /app
 
 USER app
 
-EXPOSE 3000
+EXPOSE 8488
+
+# Use Node's built-in fetch (Node 22) — no wget/curl needed
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD node -e "fetch('http://localhost:8488/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/index.js"]

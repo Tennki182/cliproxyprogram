@@ -1,181 +1,164 @@
 import { saveCredential, getActiveCredential, Credential } from '../storage/credentials.js';
-import { initializeGemini } from './gemini.js';
-import { getConfig } from '../config.js';
+import { getGeminiOAuthConfig, getCodexOAuthConfig, getIFlowOAuthConfig, getConfig } from '../config.js';
+import { pfetch } from './http.js';
 
 /**
- * Generate device code for user authorization
+ * Generate OAuth authorization URL for browser-based login
  */
-export async function generateDeviceCode(): Promise<{
-  device_code: string;
-  user_code: string;
-  verification_url: string;
-  expires_in: number;
-  interval: number;
-}> {
-  const config = getConfig();
+export function getAuthorizationUrl(baseUrl: string): string {
+  const config = getGeminiOAuthConfig();
+  const redirectUri = `${baseUrl}/auth/callback`;
 
-  // Check if API key is configured
-  if (config.apiKey) {
-    // Store API key as credential
-    const credential: Credential = {
-      account_id: 'api_key_user',
-      access_token: config.apiKey,
-      refresh_token: undefined,
-      expires_at: undefined,
-      scope: 'api_key',
-    };
-    saveCredential(credential);
-    initializeGemini(config.apiKey);
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: config.scopes.join(' '),
+    access_type: 'offline',
+    prompt: 'consent',
+  });
 
-    return {
-      device_code: 'api_key',
-      user_code: 'API_KEY',
-      verification_url: '',
-      expires_in: -1,
-      interval: -1,
-    };
-  }
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
 
-  // Check if OAuth credentials are configured
-  if (!config.oauth.clientId || config.oauth.clientId === 'YOUR_CLIENT_ID') {
-    throw new Error('请在config.yaml中配置OAuth凭据或API Key');
-  }
+/**
+ * Exchange authorization code for access and refresh tokens
+ */
+export async function exchangeCodeForTokens(code: string, baseUrl: string): Promise<Credential> {
+  const config = getGeminiOAuthConfig();
+  const redirectUri = `${baseUrl}/auth/callback`;
 
-  const response = await fetch('https://oauth2.googleapis.com/device/code', {
+  const response = await pfetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: new URLSearchParams({
-      client_id: config.oauth.clientId,
-      scope: config.oauth.scopes.join(' '),
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      code,
+      grant_type: 'authorization_code',
+      redirect_uri: redirectUri,
     }),
+  });
+
+  const tokens = await response.json() as any;
+
+  if (!tokens.access_token) {
+    throw new Error(tokens.error_description || tokens.error || 'Failed to exchange code for tokens');
+  }
+
+  // Get user info
+  let accountId = `account_${Date.now()}`;
+  let email: string | undefined;
+  try {
+    const userInfoResponse = await pfetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const userInfo = await userInfoResponse.json() as any;
+    accountId = userInfo.id || accountId;
+    email = userInfo.email;
+  } catch {
+    // Ignore errors
+  }
+
+  // Discover GCP project
+  let projectId: string | undefined;
+  try {
+    projectId = await discoverProject(tokens.access_token);
+  } catch (error) {
+    console.warn('Failed to discover project:', error);
+  }
+
+  const expiresAt = tokens.expires_in
+    ? Date.now() + tokens.expires_in * 1000
+    : undefined;
+
+  const credential: Credential = {
+    account_id: email || accountId,
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token || undefined,
+    expires_at: expiresAt,
+    scope: tokens.scope || config.scopes.join(' '),
+    project_id: projectId,
+    provider: 'gemini',
+  };
+
+  saveCredential(credential);
+  return credential;
+}
+
+/**
+ * Discover GCP project via Code Assist API
+ */
+export async function discoverProject(accessToken: string): Promise<string> {
+  const config = getConfig();
+  const baseUrl = config.gemini.apiEndpoint;
+
+  const commonHeaders = {
+    'Authorization': `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'google-api-nodejs-client/9.15.1',
+    'X-Goog-Api-Client': 'gl-node/22.17.0',
+    'Accept-Encoding': 'gzip',
+  };
+
+  const metadata = {
+    ideType: 'ANTIGRAVITY',
+    platform: 'PLATFORM_UNSPECIFIED',
+    pluginType: 'GEMINI',
+  };
+
+  // Try loadCodeAssist first
+  const response = await pfetch(`${baseUrl}:loadCodeAssist`, {
+    method: 'POST',
+    headers: commonHeaders,
+    body: JSON.stringify({ metadata }),
   });
 
   const data = await response.json() as any;
 
-  if (data.error) {
-    throw new Error(data.error_description || data.error);
+  // Project ID can be a string directly or nested under .id
+  const projectFromLoad = data.cloudaicompanionProject?.id || data.cloudaicompanionProject;
+  if (typeof projectFromLoad === 'string' && projectFromLoad) {
+    return projectFromLoad;
   }
 
-  return {
-    device_code: data.device_code,
-    user_code: data.user_code,
-    verification_url: data.verification_url,
-    expires_in: data.expires_in,
-    interval: data.interval,
-  };
-}
+  // Fallback: try onboardUser
+  const onboardResponse = await pfetch(`${baseUrl}:onboardUser`, {
+    method: 'POST',
+    headers: commonHeaders,
+    body: JSON.stringify({ metadata }),
+  });
 
-/**
- * Poll for token after user authorization
- */
-export async function pollForToken(
-  deviceCode: string,
-  interval: number = 5,
-  timeout: number = 60000
-): Promise<Credential> {
-  // Handle API key mode
-  if (deviceCode === 'api_key') {
-    const config = getConfig();
-    if (config.apiKey) {
-      const credential: Credential = {
-        account_id: 'api_key_user',
-        access_token: config.apiKey,
-        refresh_token: undefined,
-        expires_at: undefined,
-        scope: 'api_key',
-      };
-      return credential;
-    }
-    throw new Error('API Key not configured');
+  const onboardData = await onboardResponse.json() as any;
+
+  // Handle long-running operation response
+  const projectFromOnboard =
+    onboardData.response?.cloudaicompanionProject?.id ||
+    onboardData.response?.cloudaicompanionProject ||
+    onboardData.cloudaicompanionProject?.id ||
+    onboardData.cloudaicompanionProject;
+  if (typeof projectFromOnboard === 'string' && projectFromOnboard) {
+    return projectFromOnboard;
   }
 
-  const config = getConfig();
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    try {
-      const response = await fetch('https://oauth2.googleapis.com/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          client_id: config.oauth.clientId,
-          client_secret: config.oauth.clientSecret,
-          device_code: deviceCode,
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        }),
-      });
-
-      const tokens = await response.json() as any;
-
-      if (tokens.access_token) {
-        let accountId = `account_${Date.now()}`;
-        try {
-          const tokenInfoResponse = await fetch(
-            `https://oauth2.googleapis.com/tokeninfo?access_token=${tokens.access_token}`
-          );
-          const tokenInfo = await tokenInfoResponse.json() as any;
-          accountId = tokenInfo.sub || accountId;
-        } catch {
-          // Ignore errors
-        }
-
-        const credential: Credential = {
-          account_id: accountId,
-          access_token: tokens.access_token,
-          refresh_token: tokens.refresh_token || undefined,
-          expires_at: tokens.expiry_date || undefined,
-          scope: tokens.scope || config.oauth.scopes.join(' '),
-        };
-
-        saveCredential(credential);
-        initializeGemini(credential.access_token);
-
-        return credential;
-      }
-
-      if (tokens.error) {
-        if (tokens.error === 'authorization_pending') {
-          await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-          continue;
-        } else if (tokens.error === 'slow_down') {
-          await new Promise((resolve) => setTimeout(resolve, interval * 2 * 1000));
-          continue;
-        } else if (tokens.error === 'expired_token') {
-          throw new Error('Device code expired. Please request a new one.');
-        } else {
-          throw new Error(tokens.error_description || tokens.error);
-        }
-      }
-    } catch (error: any) {
-      if (error.message?.includes('authorization_pending') || error.message?.includes('slow_down')) {
-        await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-        continue;
-      }
-      throw error;
-    }
-  }
-
-  throw new Error('Token request timed out. Please try again.');
+  throw new Error('未能发现 GCP 项目，请确保已启用 Cloud AI Companion API');
 }
 
 /**
  * Refresh access token using refresh token
  */
 export async function refreshAccessToken(refreshToken: string): Promise<Credential> {
-  const config = getConfig();
-
-  const response = await fetch('https://oauth2.googleapis.com/token', {
+  const config = getGeminiOAuthConfig();
+  const response = await pfetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: new URLSearchParams({
-      client_id: config.oauth.clientId,
-      client_secret: config.oauth.clientSecret,
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
       refresh_token: refreshToken,
       grant_type: 'refresh_token',
     }),
@@ -187,28 +170,47 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
     throw new Error('Failed to refresh token');
   }
 
+  // Get user info for account ID
   let accountId = `account_${Date.now()}`;
+  let email: string | undefined;
   try {
-    const tokenInfoResponse = await fetch(
-      `https://oauth2.googleapis.com/tokeninfo?access_token=${tokens.access_token}`
-    );
-    const tokenInfo = await tokenInfoResponse.json() as any;
-    accountId = tokenInfo.sub || accountId;
+    const userInfoResponse = await pfetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const userInfo = await userInfoResponse.json() as any;
+    accountId = userInfo.id || accountId;
+    email = userInfo.email;
   } catch {
     // Ignore errors
   }
 
+  // Try to discover project if not already known
+  const existingCredential = getActiveCredential();
+  let projectId = existingCredential?.project_id;
+  if (!projectId) {
+    try {
+      projectId = await discoverProject(tokens.access_token);
+    } catch {
+      // Ignore
+    }
+  }
+
+  const expiresAt = tokens.expires_in
+    ? Date.now() + tokens.expires_in * 1000
+    : undefined;
+
+  const geminiConfig = getGeminiOAuthConfig();
   const credential: Credential = {
-    account_id: accountId,
+    account_id: email || existingCredential?.account_id || accountId,
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token || refreshToken,
-    expires_at: tokens.expiry_date || undefined,
-    scope: tokens.scope || config.oauth.scopes.join(' '),
+    expires_at: expiresAt,
+    scope: tokens.scope || geminiConfig.scopes.join(' '),
+    project_id: projectId,
+    provider: 'gemini',
   };
 
   saveCredential(credential);
-  initializeGemini(credential.access_token);
-
   return credential;
 }
 
@@ -218,9 +220,6 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
 export function hasValidCredentials(): boolean {
   const credential = getActiveCredential();
   if (!credential) return false;
-
-  // API key doesn't expire
-  if (credential.scope === 'api_key') return true;
 
   if (credential.expires_at && credential.expires_at < Date.now()) {
     return !!credential.refresh_token;
@@ -236,7 +235,7 @@ export function getCredentialStatus(): {
   hasCredentials: boolean;
   isExpired: boolean;
   accountId?: string;
-  authMethod?: string;
+  projectId?: string;
 } {
   const credential = getActiveCredential();
 
@@ -250,40 +249,20 @@ export function getCredentialStatus(): {
 
   return {
     hasCredentials: true,
-    isExpired: credential.scope === 'api_key' ? false : isExpired,
+    isExpired,
     accountId: credential.account_id,
-    authMethod: credential.scope === 'api_key' ? 'API Key' : 'OAuth',
+    projectId: credential.project_id,
   };
 }
 
 /**
- * Try to refresh token if expired
+ * Ensure valid credentials, auto-refresh if expired
  */
 export async function ensureValidCredentials(): Promise<Credential | null> {
   const credential = getActiveCredential();
 
   if (!credential) {
-    // Try to use API key from config
-    const config = getConfig();
-    if (config.apiKey) {
-      const apiKeyCredential: Credential = {
-        account_id: 'api_key_user',
-        access_token: config.apiKey,
-        refresh_token: undefined,
-        expires_at: undefined,
-        scope: 'api_key',
-      };
-      saveCredential(apiKeyCredential);
-      initializeGemini(config.apiKey);
-      return apiKeyCredential;
-    }
     return null;
-  }
-
-  // API key doesn't expire
-  if (credential.scope === 'api_key') {
-    initializeGemini(credential.access_token);
-    return credential;
   }
 
   if (credential.expires_at && credential.expires_at < Date.now() && credential.refresh_token) {
@@ -295,7 +274,143 @@ export async function ensureValidCredentials(): Promise<Credential | null> {
     }
   }
 
-  initializeGemini(credential.access_token);
-
   return credential;
+}
+
+/**
+ * Refresh Codex access token using refresh token
+ */
+export async function refreshCodexToken(refreshToken: string, accountId: string): Promise<Credential> {
+  const codexConfig = getCodexOAuthConfig();
+
+  const response = await pfetch(codexConfig.tokenEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      client_id: codexConfig.clientId,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    }),
+  });
+
+  const tokens = await response.json() as any;
+
+  if (!tokens.access_token) {
+    throw new Error('Failed to refresh Codex token: ' + (tokens.error_description || tokens.error || 'unknown error'));
+  }
+
+  const expiresAt = tokens.expires_in
+    ? Date.now() + tokens.expires_in * 1000
+    : undefined;
+
+  const credential: Credential = {
+    account_id: accountId,
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token || refreshToken,
+    expires_at: expiresAt,
+    scope: tokens.scope || 'openid email profile offline_access',
+    provider: 'codex',
+  };
+
+  saveCredential(credential);
+  return credential;
+}
+
+/**
+ * Refresh iFlow access token using refresh token
+ */
+export async function refreshIFlowToken(refreshToken: string, accountId: string): Promise<Credential> {
+  const iflowConfig = getIFlowOAuthConfig();
+
+  const basicAuth = Buffer.from(`${iflowConfig.clientId}:${iflowConfig.clientSecret}`).toString('base64');
+
+  const response = await pfetch(iflowConfig.tokenEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${basicAuth}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: iflowConfig.clientId,
+      client_secret: iflowConfig.clientSecret,
+    }),
+  });
+
+  const tokens = await response.json() as any;
+
+  if (!tokens.access_token) {
+    throw new Error('Failed to refresh iFlow token: ' + (tokens.error_description || tokens.error || 'unknown error'));
+  }
+
+  // Fetch user info to get API key
+  const userInfoResponse = await pfetch(
+    `${iflowConfig.userinfoEndpoint}?accessToken=${tokens.access_token}`,
+    { headers: { 'Accept': 'application/json' } }
+  );
+
+  const userInfo = await userInfoResponse.json() as any;
+
+  if (!userInfo.success || !userInfo.data?.apiKey) {
+    throw new Error('Failed to get iFlow API key during token refresh');
+  }
+
+  const apiKey = userInfo.data.apiKey;
+  const email = userInfo.data.email || userInfo.data.phone || accountId;
+
+  const expiresAt = tokens.expires_in
+    ? Date.now() + tokens.expires_in * 1000
+    : undefined;
+
+  const credential: Credential = {
+    account_id: email,
+    access_token: apiKey, // iFlow uses API key as access token
+    refresh_token: tokens.refresh_token || refreshToken,
+    expires_at: expiresAt,
+    scope: tokens.scope || '',
+    provider: 'iflow',
+  };
+
+  saveCredential(credential);
+  return credential;
+}
+
+/**
+ * Get a credential by provider and optionally refresh if expired
+ */
+export async function getValidCredential(provider: string): Promise<Credential | null> {
+  const db = await import('../storage/credentials.js');
+  const credentials = db.listCredentials();
+  
+  const now = Date.now();
+  
+  // Find a non-rate-limited credential for this provider
+  for (const cred of credentials) {
+    if (provider && cred.provider !== provider) continue;
+    if (cred.rate_limited_until && cred.rate_limited_until * 1000 > now) continue;
+    
+    // Check if expired and has refresh token
+    if (cred.expires_at && cred.expires_at < now && cred.refresh_token) {
+      try {
+        if (provider === 'codex') {
+          return await refreshCodexToken(cred.refresh_token, cred.account_id);
+        } else if (provider === 'iflow') {
+          return await refreshIFlowToken(cred.refresh_token, cred.account_id);
+        } else if (provider === 'gemini') {
+          return await refreshAccessToken(cred.refresh_token);
+        }
+      } catch {
+        // Refresh failed, continue to next credential
+        continue;
+      }
+    }
+    
+    // Token is valid
+    return cred;
+  }
+  
+  return null;
 }
