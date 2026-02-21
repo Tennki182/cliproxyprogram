@@ -21,6 +21,11 @@ FROM node:22-slim
 
 WORKDIR /app
 
+# Install su-exec for switching users in entrypoint
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    su-exec \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install production node_modules (sql.js is pure WASM, no native tools needed)
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --omit=optional
@@ -29,13 +34,15 @@ RUN npm ci --omit=dev --omit=optional
 COPY --from=builder /app/dist ./dist/
 COPY public/ ./public/
 
-# Non-root user
+# Create non-root user and directories
 RUN addgroup --system --gid 1001 nodejs \
     && adduser --system --uid 1001 app \
     && mkdir -p /app/data \
     && chown -R app:nodejs /app
 
-USER app
+# Copy and set up entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8488
 
@@ -43,4 +50,5 @@ EXPOSE 8488
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD node -e "fetch('http://localhost:8488/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]

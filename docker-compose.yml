@@ -10,8 +10,8 @@ services:
     volumes:
       # Persistent database + session files
       - ./data:/app/data
-      # Config file (edit on host, read-only inside container)
-      - ./config.yaml:/app/config.yaml:ro
+      # Config file (edit on host, writable inside container)
+      - ./config.yaml:/app/config.yaml
     environment:
       - NODE_ENV=production
       - TZ=Asia/Shanghai
