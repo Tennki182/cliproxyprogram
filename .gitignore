@@ -33,11 +33,8 @@ codex_tree.json
 .DS_Store
 Thumbs.db
 
-# Docs (local only)
+# Docs
 docs/
-AGENTS.md
-CLAUDE.md
-CHANGES.md
 
 # Claude AI
 .claude/
