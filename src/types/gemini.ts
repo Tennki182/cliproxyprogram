@@ -7,6 +7,7 @@ export interface GeminiContent {
 
 export interface GeminiTextPart {
   text: string;
+  thought?: boolean;
 }
 
 export interface GeminiInlineDataPart {
@@ -32,6 +33,17 @@ export interface GeminiFunctionResponsePart {
 
 export type GeminiPart = GeminiTextPart | GeminiInlineDataPart | GeminiFunctionCallPart | GeminiFunctionResponsePart;
 
+export interface GeminiThinkingConfig {
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
+  thinkingLevel?: 'low' | 'medium' | 'high' | 'none';
+}
+
+export interface GeminiImageConfig {
+  aspectRatio?: string;
+  imageSize?: string;
+}
+
 export interface GeminiGenerationConfig {
   temperature?: number;
   topP?: number;
@@ -41,6 +53,9 @@ export interface GeminiGenerationConfig {
   candidateCount?: number;
   frequencyPenalty?: number;
   presencePenalty?: number;
+  thinkingConfig?: GeminiThinkingConfig;
+  responseModalities?: ('TEXT' | 'IMAGE')[];
+  imageConfig?: GeminiImageConfig;
 }
 
 export interface GeminiFunctionDeclaration {

@@ -1,8 +1,23 @@
 // OpenAI API Types
 
+export interface OpenAIImageUrlPart {
+  type: 'image_url';
+  image_url: {
+    url: string;
+    detail?: 'auto' | 'low' | 'high';
+  };
+}
+
+export interface OpenAITextPart {
+  type: 'text';
+  text: string;
+}
+
+export type OpenAIMessageContent = string | (OpenAITextPart | OpenAIImageUrlPart)[];
+
 export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content: OpenAIMessageContent;
   name?: string;
   tool_call_id?: string;
 }
@@ -31,9 +46,17 @@ export interface OpenAIChatCompletionRequest {
   max_tokens?: number;
   stop?: string | string[];
   stream?: boolean;
-  tools?: OpenAITool[];
-  tool_choice?: OpenAIToolChoice;
+  tools?: any[];
+  tool_choice?: any;
   user?: string;
+  // Gemini thinking/reasoning support
+  reasoning_effort?: 'low' | 'medium' | 'high';
+  // Image generation support
+  modalities?: ('text' | 'image')[];
+  image_config?: {
+    aspect_ratio?: string;
+    image_size?: string;
+  };
 }
 
 export interface OpenAIChatMessage {
@@ -57,6 +80,7 @@ export interface OpenAIChatChoice {
   message: {
     role: 'assistant';
     content: string | null;
+    reasoning_content?: string | null;
     tool_calls?: OpenAIToolCall[];
   };
   finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
@@ -80,6 +104,7 @@ export interface OpenAIChatChunkChoice {
   delta: {
     role?: 'assistant';
     content?: string | null;
+    reasoning_content?: string | null;
     tool_calls?: OpenAIToolCall[];
   };
   finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;

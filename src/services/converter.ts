@@ -2,6 +2,7 @@ import {
   OpenAIMessage,
   OpenAIToolChoice,
   OpenAIChatCompletionRequest,
+  OpenAIMessageContent,
 } from '../types/openai.js';
 import {
   GeminiContent,
@@ -10,6 +11,7 @@ import {
   GeminiTool,
   GeminiToolConfig,
   GeminiFunctionResponsePart,
+  GeminiThinkingConfig,
 } from '../types/gemini.js';
 
 export interface ConvertOptions {
@@ -37,6 +39,60 @@ function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string
 }
 
 /**
+ * Parse base64 data URL to extract mime type and data
+ */
+function parseDataUrl(url: string): { mimeType: string; data: string } | null {
+  if (!url.startsWith('data:')) return null;
+  
+  const commaIndex = url.indexOf(',');
+  if (commaIndex === -1) return null;
+  
+  const header = url.substring(5, commaIndex);
+  const data = url.substring(commaIndex + 1);
+  
+  // Parse mime type from header (e.g., "image/png;base64")
+  const semiIndex = header.indexOf(';');
+  const mimeType = semiIndex !== -1 ? header.substring(0, semiIndex) : header;
+  
+  return { mimeType, data };
+}
+
+/**
+ * Convert OpenAI message content to Gemini parts
+ */
+function convertContentToParts(content: OpenAIMessageContent): any[] {
+  // String content
+  if (typeof content === 'string') {
+    return [{ text: content }];
+  }
+  
+  // Array content (multimodal)
+  if (Array.isArray(content)) {
+    const parts: any[] = [];
+    
+    for (const item of content) {
+      if (item.type === 'text') {
+        parts.push({ text: item.text });
+      } else if (item.type === 'image_url') {
+        const parsed = parseDataUrl(item.image_url.url);
+        if (parsed) {
+          parts.push({
+            inlineData: {
+              mimeType: parsed.mimeType,
+              data: parsed.data,
+            },
+          });
+        }
+      }
+    }
+    
+    return parts;
+  }
+  
+  return [];
+}
+
+/**
  * Convert OpenAI messages to Gemini contents format
  */
 export function convertMessagesToContents(
@@ -56,13 +112,18 @@ export function convertMessagesToContents(
     if (msg.role === 'user') {
       contents.push({
         role: 'user',
-        parts: [{ text: msg.content }],
+        parts: convertContentToParts(msg.content),
       });
     } else if (msg.role === 'assistant') {
       const parts: any[] = [];
 
+      // Handle content (text or multimodal)
       if (msg.content) {
-        parts.push({ text: msg.content });
+        if (typeof msg.content === 'string' && msg.content) {
+          parts.push({ text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          parts.push(...convertContentToParts(msg.content));
+        }
       }
 
       // Handle tool calls - add thoughtSignature for cloudcode-pa API
@@ -124,7 +185,26 @@ export function extractSystemInstruction(
 
   return {
     role: 'user',
-    parts: [{ text: systemMsg.content }],
+    parts: convertContentToParts(systemMsg.content),
+  };
+}
+
+/**
+ * Convert reasoning_effort to Gemini thinkingConfig
+ */
+function convertReasoningEffort(effort?: 'low' | 'medium' | 'high'): GeminiThinkingConfig | undefined {
+  if (!effort) return undefined;
+  
+  if (effort === 'auto') {
+    return {
+      thinkingBudget: -1,
+      includeThoughts: true,
+    };
+  }
+  
+  return {
+    thinkingLevel: effort,
+    includeThoughts: effort !== 'none',
   };
 }
 
@@ -154,8 +234,28 @@ export function convertToGeminiConfig(
       : [request.stop];
   }
 
-  // Frequency and presence penalties are not directly supported in Gemini
-  // but we can simulate them with temperature adjustments if needed
+  // Convert reasoning_effort to thinkingConfig
+  if (request.reasoning_effort !== undefined) {
+    config.thinkingConfig = convertReasoningEffort(request.reasoning_effort);
+  }
+
+  // Convert modalities to responseModalities
+  if (request.modalities && request.modalities.length > 0) {
+    config.responseModalities = request.modalities.map(m => 
+      m === 'image' ? 'IMAGE' : 'TEXT'
+    );
+  }
+
+  // Convert image_config
+  if (request.image_config) {
+    config.imageConfig = {};
+    if (request.image_config.aspect_ratio) {
+      config.imageConfig.aspectRatio = request.image_config.aspect_ratio;
+    }
+    if (request.image_config.image_size) {
+      config.imageConfig.imageSize = request.image_config.image_size;
+    }
+  }
 
   return config;
 }
@@ -224,6 +324,8 @@ function cleanSchemaForGemini(schema: Record<string, unknown> | undefined): any 
   delete cleaned.$defs;
   delete cleaned.definitions;
   delete cleaned.strict;
+  delete cleaned.$schema;
+  delete cleaned.additionalProperties;
 
   // Process properties recursively
   if (cleaned.properties && typeof cleaned.properties === 'object') {
@@ -282,20 +384,26 @@ function mergeAllOf(allOf: any[]): any {
 /**
  * Convert tool choice to Gemini tool config
  */
-export function convertToolChoice(
-  toolChoice?: OpenAIToolChoice
-): GeminiToolConfig | undefined {
+export function convertToolChoice(toolChoice?: any): GeminiToolConfig | undefined {
   if (!toolChoice) return undefined;
 
-  if (toolChoice.type === 'none') {
-    return {
-      functionCallingConfig: {
-        mode: 'NONE',
-      },
-    };
+  // Handle string format: "none", "auto", "required"
+  if (typeof toolChoice === 'string') {
+    if (toolChoice === 'none') {
+      return { functionCallingConfig: { mode: 'NONE' } };
+    }
+    if (toolChoice === 'required') {
+      return { functionCallingConfig: { mode: 'ANY' } };
+    }
+    return { functionCallingConfig: { mode: 'AUTO' } };
   }
 
-  if (toolChoice.type === 'function' && toolChoice.function) {
+  // Handle object format
+  if (toolChoice.type === 'none') {
+    return { functionCallingConfig: { mode: 'NONE' } };
+  }
+
+  if (toolChoice.type === 'function' && toolChoice.function?.name) {
     return {
       functionCallingConfig: {
         mode: 'ANY',
@@ -304,10 +412,21 @@ export function convertToolChoice(
     };
   }
 
-  // 'auto' mode
+  // 'auto' mode (default)
   return {
     functionCallingConfig: {
       mode: 'AUTO',
     },
   };
+}
+
+/**
+ * Check if content has image parts
+ */
+export function hasImageContent(content: OpenAIMessageContent): boolean {
+  if (typeof content === 'string') return false;
+  if (Array.isArray(content)) {
+    return content.some(item => item.type === 'image_url');
+  }
+  return false;
 }
