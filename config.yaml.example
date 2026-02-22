@@ -82,10 +82,12 @@ kimi:
   supportedModels: []
   modelAliases: {}
   excludedModels: []
+# Gemini CLI OAuth credentials (参考 https://github.com/Tennki182/CLIProxyAPI)
+# 如果要使用自己的 OAuth 应用，请替换以下 clientId 和 clientSecret
 oauth:
   gemini:
-    clientId: your-google-client-id.apps.googleusercontent.com
-    clientSecret: your-google-client-secret
+    clientId: 681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com
+    clientSecret: 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
     scopes:
       - https://www.googleapis.com/auth/cloud-platform
       - https://www.googleapis.com/auth/userinfo.email

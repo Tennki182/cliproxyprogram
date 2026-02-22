@@ -85,6 +85,12 @@
       </svg>
       <span>管理</span>
     </div>
+    <div class="nav-item" data-page="stats" onclick="go('stats')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>
+      </svg>
+      <span>统计</span>
+    </div>
     <div class="nav-item" data-page="logs" onclick="go('logs')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>
@@ -504,6 +510,121 @@
             <input type="text" id="settingLoginSecret" class="form-input" placeholder="加载中...">
           </div>
           <button class="btn btn-primary btn-sm" onclick="saveAuthSettings('loginSecret')" style="padding:8px 16px;">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stats Page -->
+    <div id="page-stats" class="page">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon purple">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </div>
+          <div class="stat-value" id="statsTotalRequests">0</div>
+          <div class="stat-label">总请求数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+          <div class="stat-value" id="statsSuccessRequests">0</div>
+          <div class="stat-label">成功请求</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+            </svg>
+          </div>
+          <div class="stat-value" id="statsFailedRequests">0</div>
+          <div class="stat-label">失败请求</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon cyan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2v20M2 12h20"/>
+            </svg>
+          </div>
+          <div class="stat-value" id="statsTotalTokens">0</div>
+          <div class="stat-label">总 Token 数</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+              </svg>
+            </div>
+            凭证用量统计
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadUsageStats()">刷新</button>
+        </div>
+        <div id="credentialStatsList" style="max-height: 400px; overflow-y: auto;">
+          <p style="color: var(--text-muted); text-align: center; padding: 40px;">加载中...</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+              </svg>
+            </div>
+            最近 7 天用量
+          </div>
+        </div>
+        <div id="dailyStatsChart" style="padding: 20px;">
+          <p style="color: var(--text-muted); text-align: center;">加载中...</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </div>
+            今日每小时用量
+          </div>
+        </div>
+        <div id="hourlyStatsChart" style="padding: 20px;">
+          <p style="color: var(--text-muted); text-align: center;">加载中...</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>
+              </svg>
+            </div>
+            最近请求记录
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <select id="historyLimit" class="form-select" style="width: auto; padding: 4px 8px; font-size: 12px;" onchange="loadRequestHistory()">
+              <option value="20">20 条</option>
+              <option value="50" selected>50 条</option>
+              <option value="100">100 条</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" onclick="loadRequestHistory()">刷新</button>
+          </div>
+        </div>
+        <div id="requestHistoryList" style="max-height: 400px; overflow-y: auto;">
+          <p style="color: var(--text-muted); text-align: center; padding: 40px;">加载中...</p>
         </div>
       </div>
     </div>

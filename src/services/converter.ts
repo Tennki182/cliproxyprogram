@@ -233,8 +233,14 @@ export function convertToGeminiConfig(
       : [request.stop];
   }
 
-  // Convert reasoning_effort to thinkingConfig
-  if (request.reasoning_effort !== undefined) {
+  // Convert reasoning_effort or thinking_budget to thinkingConfig
+  if (request.thinking_budget !== undefined) {
+    // Direct thinking budget takes precedence
+    config.thinkingConfig = {
+      thinkingBudget: request.thinking_budget,
+      includeThoughts: request.thinking_budget !== 0,
+    };
+  } else if (request.reasoning_effort !== undefined) {
     config.thinkingConfig = convertReasoningEffort(request.reasoning_effort);
   }
 

@@ -51,6 +51,7 @@ export interface OpenAIChatCompletionRequest {
   user?: string;
   // Gemini thinking/reasoning support
   reasoning_effort?: 'low' | 'medium' | 'high';
+  thinking_budget?: number;  // Direct thinking budget in tokens (-1 for auto)
   // Image generation support
   modalities?: ('text' | 'image')[];
   image_config?: {

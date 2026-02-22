@@ -95,6 +95,7 @@ function go(page) {
   if (page === 'models') loadModels();
   if (page === 'manage') loadCredentials();
   if (page === 'logs') startLogStream();
+  if (page === 'stats') { loadUsageStats(); loadRequestHistory(); }
 }
 
 async function rpc(ep, opts = {}) {
@@ -740,3 +741,235 @@ function esc(str) {
   if (!str) return '';
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
+
+
+// ========== Usage Statistics ==========
+let usageDataCache = null;
+let requestHistoryCache = null;
+
+async function loadUsageStats() {
+  try {
+    // Load all usage data in parallel
+    const [usage, credentials, daily, hourly] = await Promise.all([
+      rpc('/v0/management/usage'),
+      rpc('/v0/management/usage/credentials'),
+      rpc('/v0/management/usage/daily?days=7'),
+      rpc('/v0/management/usage/hourly')
+    ]);
+    
+    usageDataCache = { usage, credentials, daily, hourly };
+    
+    // Update summary stats - rpc returns { ok, data, status }, data contains the actual response
+    const usageData = usage.data || {};
+    if (usageData.global) {
+      $('statsTotalRequests').textContent = formatNumber(usageData.global.totalRequests);
+      $('statsSuccessRequests').textContent = formatNumber(usageData.global.successCount);
+      $('statsFailedRequests').textContent = formatNumber(usageData.global.failureCount);
+      $('statsTotalTokens').textContent = formatNumber(usageData.global.totalTokens);
+    }
+    
+    // Render credential stats
+    const credData = credentials.data || {};
+    renderCredentialStats(credData.credentials || []);
+    
+    // Render daily chart
+    const dailyData = daily.data || {};
+    renderDailyChart(dailyData.daily || []);
+    
+    // Render hourly chart
+    const hourlyData = hourly.data || {};
+    renderHourlyChart(hourlyData.hourly || []);
+    
+  } catch (e) {
+    console.error('Failed to load usage stats:', e);
+    toast('加载统计数据失败', 'error');
+  }
+}
+
+function renderCredentialStats(credentials) {
+  const container = $('credentialStatsList');
+  if (!credentials || credentials.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>暂无凭证使用数据</p></div>';
+    return;
+  }
+  
+  // Calculate totals for percentages
+  const totalRequests = credentials.reduce((sum, c) => sum + (c.totalRequests || c.requests || 0), 0);
+  const totalTokens = credentials.reduce((sum, c) => sum + (c.totalTokens || (c.tokens && c.tokens.total) || 0), 0);
+  
+  let html = '<table class="stats-table"><thead><tr>';
+  html += '<th>凭证</th><th>提供商</th><th>请求数</th><th>模型数</th>';
+  html += '<th>Token 总计</th><th>占比</th>';
+  html += '</tr></thead><tbody>';
+  
+  credentials.forEach(c => {
+    const providerClass = `provider-${c.provider || 'unknown'}`;
+    const requests = c.totalRequests || c.requests || 0;
+    const tokens = c.totalTokens || (c.tokens && c.tokens.total) || 0;
+    const requestPercent = totalRequests > 0 ? Math.round((requests / totalRequests) * 100) : 0;
+    const modelCount = c.models ? c.models.length : 0;
+    
+    html += '<tr>';
+    html += `<td><code>${esc((c.accountId || 'unknown').substring(0, 20))}</code></td>`;
+    html += `<td><span class="provider-badge ${providerClass}">${esc(c.provider || 'unknown')}</span></td>`;
+    html += `<td class="number text-right">${formatNumber(requests)}</td>`;
+    html += `<td class="number text-right">${modelCount}</td>`;
+    html += `<td class="number text-right"><strong>${formatNumber(tokens)}</strong></td>`;
+    html += `<td><div class="bar-item" style="width:60px"><div class="bar" style="height:8px;width:${requestPercent}%;background:var(--accent-primary)"></div><div class="bar-label">${requestPercent}%</div></div></td>`;
+    html += '</tr>';
+  });
+  
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function renderDailyChart(dailyData) {
+  const container = $('dailyStatsChart');
+  if (!dailyData || dailyData.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>暂无日统计数据</p></div>';
+    return;
+  }
+  
+  // Backend returns {date, totalRequests, totalTokens, byProvider}
+  const maxRequests = Math.max(...dailyData.map(d => d.totalRequests || 0), 1);
+  
+  let html = '<div class="bar-chart">';
+  
+  dailyData.forEach(day => {
+    const requests = day.totalRequests || 0;
+    const height = Math.max((requests / maxRequests) * 100, 4);
+    const date = new Date(day.date);
+    const label = `${date.getMonth() + 1}/${date.getDate()}`;
+    
+    html += '<div class="bar-item">';
+    html += `<div class="bar" style="height:${height}%" data-value="${formatNumber(requests)}"></div>`;
+    html += `<div class="bar-value">${formatNumber(requests)}</div>`;
+    html += `<div class="bar-label">${label}</div>`;
+    html += '</div>';
+  });
+  
+  html += '</div>';
+  
+  // Add provider breakdown
+  html += '<div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-subtle);">';
+  html += '<div style="display: flex; gap: 24px; flex-wrap: wrap; font-size: 12px;">';
+  
+  // Aggregate by provider (backend uses byProvider)
+  const providerStats = {};
+  dailyData.forEach(day => {
+    Object.entries(day.byProvider || {}).forEach(([provider, stats]) => {
+      if (!providerStats[provider]) providerStats[provider] = { requests: 0, tokens: 0 };
+      providerStats[provider].requests += stats.requests || 0;
+      providerStats[provider].tokens += stats.tokens || 0;
+    });
+  });
+  
+  Object.entries(providerStats).forEach(([provider, stats]) => {
+    const providerClass = `provider-${provider}`;
+    html += `<div style="display: flex; align-items: center; gap: 8px;">`;
+    html += `<span class="provider-badge ${providerClass}">${esc(provider)}</span>`;
+    html += `<span style="color: var(--text-muted);">${formatNumber(stats.requests)} 请求</span>`;
+    html += `<span style="color: var(--text-muted);">·</span>`;
+    html += `<span style="color: var(--text-muted);">${formatNumber(stats.tokens)} tokens</span>`;
+    html += '</div>';
+  });
+  
+  html += '</div></div>';
+  
+  container.innerHTML = html;
+}
+
+function renderHourlyChart(hourlyData) {
+  const container = $('hourlyStatsChart');
+  if (!hourlyData || hourlyData.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>暂无小时统计数据</p></div>';
+    return;
+  }
+  
+  // Find max for scaling
+  const maxRequests = Math.max(...hourlyData.map(h => h.requests), 1);
+  
+  let html = '<div class="bar-chart">';
+  
+  hourlyData.forEach(hour => {
+    const height = Math.max((hour.requests / maxRequests) * 100, 4);
+    const label = `${String(hour.hour).padStart(2, '0')}`;
+    
+    html += '<div class="bar-item">';
+    html += `<div class="bar" style="height:${height}%" data-value="${formatNumber(hour.requests)}"></div>`;
+    html += `<div class="bar-value">${formatNumber(hour.requests)}</div>`;
+    html += `<div class="bar-label">${label}:00</div>`;
+    html += '</div>';
+  });
+  
+  html += '</div>';
+  
+  // Summary
+  const totalRequests = hourlyData.reduce((sum, h) => sum + h.requests, 0);
+  const totalTokens = hourlyData.reduce((sum, h) => sum + h.tokens, 0);
+  
+  html += '<div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-subtle);">';
+  html += '<div class="stats-summary">';
+  html += `<div class="stats-summary-item"><div class="stats-summary-label">今日请求</div><div class="stats-summary-value">${formatNumber(totalRequests)}</div></div>`;
+  html += `<div class="stats-summary-item"><div class="stats-summary-label">今日 Token</div><div class="stats-summary-value">${formatNumber(totalTokens)}</div></div>`;
+  html += `<div class="stats-summary-item"><div class="stats-summary-label">平均每时</div><div class="stats-summary-value">${formatNumber(Math.round(totalRequests / 24))}</div></div>`;
+  html += '</div></div>';
+  
+  container.innerHTML = html;
+}
+
+async function loadRequestHistory() {
+  const limit = parseInt($('historyLimit').value) || 50;
+  try {
+    const result = await rpc(`/v0/management/history?limit=${limit}`);
+    const resultData = result.data || {};
+    requestHistoryCache = resultData.history || [];
+    renderRequestHistory(requestHistoryCache);
+  } catch (e) {
+    console.error('Failed to load request history:', e);
+    $('requestHistoryList').innerHTML = '<div class="empty-state"><p>加载请求历史失败</p></div>';
+  }
+}
+
+function renderRequestHistory(history) {
+  const container = $('requestHistoryList');
+  if (!history || history.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>暂无请求记录</p></div>';
+    return;
+  }
+  
+  let html = '<table class="history-table"><thead><tr>';
+  html += '<th>时间</th><th>凭证</th><th>提供商</th><th>模型</th><th>Token 输入</th><th>Token 输出</th><th>状态</th>';
+  html += '</tr></thead><tbody>';
+  
+  history.forEach(req => {
+    const time = new Date(req.timestamp);
+    const timeStr = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}:${String(time.getSeconds()).padStart(2, '0')}`;
+    const providerClass = `provider-${req.provider || 'unknown'}`;
+    const statusIcon = req.success ? '<span class="success-badge">✓</span>' : '<span class="error-badge">✗</span>';
+    // Backend returns inputTokens/outputTokens, not tokens.input/tokens.output
+    const inputTokens = req.inputTokens !== undefined ? req.inputTokens : (req.tokens && req.tokens.input) || 0;
+    const outputTokens = req.outputTokens !== undefined ? req.outputTokens : (req.tokens && req.tokens.output) || 0;
+    
+    html += '<tr>';
+    html += `<td class="time">${timeStr}</td>`;
+    html += `<td><code>${esc((req.accountId || 'unknown').substring(0, 16))}</code></td>`;
+    html += `<td><span class="provider-badge ${providerClass}">${esc(req.provider || 'unknown')}</span></td>`;
+    html += `<td class="model" title="${esc(req.model)}">${esc(req.model || 'unknown')}</td>`;
+    html += `<td class="tokens">${formatNumber(inputTokens)}</td>`;
+    html += `<td class="tokens">${formatNumber(outputTokens)}</td>`;
+    html += `<td>${statusIcon}</td>`;
+    html += '</tr>';
+  });
+  
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function formatNumber(num) {
+  if (num === undefined || num === null) return '0';
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+  return num.toString();
+}
+
