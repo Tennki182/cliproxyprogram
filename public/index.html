@@ -1462,6 +1462,15 @@
               <span>iFlow Chat - 通过 OAuth 获取 API Key</span>
             </li>
           </ul>
+          <div id="remoteAccessHint" style="display:none;margin-top:16px;padding:14px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.15);border-radius:10px;">
+            <p style="color:var(--accent-primary);font-weight:500;margin-bottom:6px;">远程访问模式</p>
+            <p style="color:var(--text-muted);font-size:12px;line-height:1.7;margin:0;">
+              检测到你正在通过远程地址访问管理面板。点击 Provider 卡片后将弹出引导窗口：<br>
+              1. 点击链接在新标签页完成 OAuth 登录<br>
+              2. 登录后浏览器跳转到 localhost（页面无法加载是正常的）<br>
+              3. 复制地址栏完整 URL 粘贴回引导窗口即可完成认证
+            </p>
+          </div>
         </div>
       </div>
     </div>
@@ -1785,6 +1794,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(updateUptime, 1000);
   $('chatTemp').addEventListener('input', (e) => $('tempValue').textContent = e.target.value);
   $('sysPort').textContent = location.port || (location.protocol === 'https:' ? '443' : '80');
+  if (isRemoteAccess()) $('remoteAccessHint').style.display = 'block';
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.dropdown')) toggleAddMenu(false);
   });
