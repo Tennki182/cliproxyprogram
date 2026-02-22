@@ -18,7 +18,7 @@ export function getAuthorizationUrl(baseUrl: string): string {
     prompt: 'consent',
   });
 
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  return `https://accounts.google.com/o/oauth2/auth?${params.toString()}`;
 }
 
 /**

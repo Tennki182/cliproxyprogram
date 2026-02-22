@@ -44,12 +44,75 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     </script>`;
 
   /**
+   * Detect if the request originates from localhost
+   */
+  function isLocalRequest(request: import('fastify').FastifyRequest): boolean {
+    const host = (request.headers['x-forwarded-host'] as string) || request.headers.host || '';
+    const hostname = host.split(':')[0];
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  }
+
+  /**
    * GET /auth/login - Redirect to Google OAuth consent screen
+   * On VPS (non-localhost), show a manual auth page instead of direct redirect
    */
   fastify.get('/auth/login', async (request, reply) => {
+    if (isLocalRequest(request)) {
+      // Local access: direct redirect to Google OAuth
+      const baseUrl = getBaseUrl(request);
+      const authUrl = getAuthorizationUrl(baseUrl);
+      return reply.redirect(authUrl);
+    }
+
+    // Remote/VPS access: use localhost-based redirect_uri and show manual auth page
+    const port = getConfig().server.port;
+    const localhostBase = `http://localhost:${port}`;
+    const authUrl = getAuthorizationUrl(localhostBase);
     const baseUrl = getBaseUrl(request);
-    const authUrl = getAuthorizationUrl(baseUrl);
-    return reply.redirect(authUrl);
+
+    return reply.type('text/html').send(
+      `<html><head>${PAGE_STYLE}</head><body><div class="box">
+        <span class="tag tag-ok">远程认证</span>
+        <h2>Google (Gemini) 远程授权</h2>
+        <p>检测到您通过远程方式访问，请按以下步骤完成认证：</p>
+        <div class="hint">
+          <strong>步骤 1</strong>：<a href="${escapeHtml(authUrl)}" target="_blank" style="color:#7c5cf8">点击此处打开 Google 授权页面</a><br>
+          <strong>步骤 2</strong>：完成授权后，浏览器会跳转到 <code>http://localhost:...</code> 并显示错误（这是正常的）<br>
+          <strong>步骤 3</strong>：复制浏览器地址栏中的完整 URL，粘贴到下方输入框
+        </div>
+        <form onsubmit="return submitCallback()" style="margin-top:16px;text-align:left;">
+          <input id="callbackUrl" type="text" placeholder="粘贴回调 URL (http://localhost:...?code=...)" style="width:100%;background:#111;border:1px solid #333;color:#f2f2f4;border-radius:6px;padding:10px;font-size:13px;font-family:monospace;">
+          <button type="submit" style="margin-top:10px;background:#7c5cf8;color:#fff;border:none;padding:8px 20px;border-radius:6px;cursor:pointer;font-size:13px;">提交</button>
+        </form>
+        <p id="resultMsg" style="margin-top:12px;display:none;"></p>
+        <br><a href="/">返回管理面板</a>
+        <script>
+        async function submitCallback(){
+          var url=document.getElementById('callbackUrl').value.trim();
+          if(!url){alert('请粘贴回调 URL');return false;}
+          var msg=document.getElementById('resultMsg');
+          msg.style.display='none';
+          try{
+            var r=await fetch('${baseUrl}/auth/remote/exchange',{
+              method:'POST',
+              headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('proxy_login_secret')||'')},
+              body:JSON.stringify({provider:'gemini',callbackUrl:url})
+            });
+            var d=await r.json();
+            if(d.success){
+              msg.className='ok';msg.textContent='认证成功: '+d.accountId;msg.style.display='block';
+              setTimeout(function(){location.href='/';},1500);
+            }else{
+              msg.className='err';msg.textContent='失败: '+(d.error||'未知错误');msg.style.display='block';
+            }
+          }catch(e){
+            msg.className='err';msg.textContent='请求失败: '+e.message;msg.style.display='block';
+          }
+          return false;
+        }
+        </script>
+      </div></body></html>`
+    );
   });
 
   /**

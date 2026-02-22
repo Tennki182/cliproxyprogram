@@ -208,6 +208,7 @@ function startCallbackServer(adminOrigin: string): Promise<void> {
 export async function codexAuthRoutes(fastify: FastifyInstance): Promise<void> {
   /**
    * GET /auth/codex/login — Redirect to OpenAI OAuth with PKCE
+   * On VPS (non-localhost), show a manual auth page instead of starting callback server
    */
   fastify.get('/auth/codex/login', async (request, reply) => {
     // Remember the admin panel origin for redirect-back links
@@ -215,11 +216,11 @@ export async function codexAuthRoutes(fastify: FastifyInstance): Promise<void> {
     const host = (request.headers['x-forwarded-host'] as string) || request.headers.host || 'localhost:8488';
     const adminOrigin = `${proto}://${host}`;
 
+    const hostname = host.split(':')[0];
+    const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+
     // Generate PKCE
     const { challenge, state } = generatePkce();
-
-    // Start temporary callback server (OpenAI requires localhost:1455)
-    await startCallbackServer(adminOrigin);
 
     const codexConfig = getCodexOAuthConfig();
     const params = new URLSearchParams({
@@ -235,7 +236,58 @@ export async function codexAuthRoutes(fastify: FastifyInstance): Promise<void> {
       codex_cli_simplified_flow: 'true',
     });
 
-    return reply.redirect(`${codexConfig.authEndpoint}?${params.toString()}`);
+    const authUrl = `${codexConfig.authEndpoint}?${params.toString()}`;
+
+    if (isLocal) {
+      // Local access: start temporary callback server and redirect
+      await startCallbackServer(adminOrigin);
+      return reply.redirect(authUrl);
+    }
+
+    // Remote/VPS: show manual auth page (no callback server since it can't receive the redirect)
+    return reply.type('text/html; charset=utf-8').send(
+      `<html><head>${PAGE_HEAD}</head><body><div class="box">
+        <span class="tag tag-ok">远程认证</span>
+        <h2>Codex (OpenAI) 远程授权</h2>
+        <p>检测到您通过远程方式访问，请按以下步骤完成认证：</p>
+        <div class="manual-box" style="padding:14px;background:#1a1a2e;border:1px solid #333;border-radius:8px;font-size:13px;color:#ccc;line-height:1.7">
+          <strong>步骤 1</strong>：<a href="${escapeHtml(authUrl)}" target="_blank" style="color:#7c5cf8">点击此处打开 OpenAI 授权页面</a><br>
+          <strong>步骤 2</strong>：完成授权后，浏览器会跳转到 <code>http://localhost:1455/...</code> 并显示错误（这是正常的）<br>
+          <strong>步骤 3</strong>：复制浏览器地址栏中的完整 URL，粘贴到下方输入框
+        </div>
+        <form onsubmit="return submitCallback()" style="margin-top:16px;text-align:left;">
+          <input id="callbackUrl" type="text" placeholder="粘贴回调 URL (http://localhost:1455/...?code=...)" style="width:100%;background:#111;border:1px solid #333;color:#f2f2f4;border-radius:6px;padding:10px;font-size:13px;font-family:monospace;">
+          <button type="submit" style="margin-top:10px;background:#7c5cf8;color:#fff;border:none;padding:8px 20px;border-radius:6px;cursor:pointer;font-size:13px;">提交</button>
+        </form>
+        <p id="resultMsg" style="margin-top:12px;display:none;"></p>
+        <br><a href="/">返回管理面板</a>
+        <script>
+        async function submitCallback(){
+          var url=document.getElementById('callbackUrl').value.trim();
+          if(!url){alert('请粘贴回调 URL');return false;}
+          var msg=document.getElementById('resultMsg');
+          msg.style.display='none';
+          try{
+            var r=await fetch('${adminOrigin}/auth/remote/exchange',{
+              method:'POST',
+              headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('proxy_login_secret')||'')},
+              body:JSON.stringify({provider:'codex',callbackUrl:url})
+            });
+            var d=await r.json();
+            if(d.success){
+              msg.className='ok';msg.textContent='认证成功: '+d.accountId;msg.style.display='block';
+              setTimeout(function(){location.href='/';},1500);
+            }else{
+              msg.className='err';msg.textContent='失败: '+(d.error||'未知错误');msg.style.display='block';
+            }
+          }catch(e){
+            msg.className='err';msg.textContent='请求失败: '+e.message;msg.style.display='block';
+          }
+          return false;
+        }
+        </script>
+      </div></body></html>`
+    );
   });
 
   /**
