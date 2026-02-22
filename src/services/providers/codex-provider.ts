@@ -11,38 +11,142 @@ function getTimestamp(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+const TOOL_NAME_LIMIT = 64;
+
+/**
+ * Shorten tool name if needed (Codex has 64 char limit)
+ * Preserves mcp__ prefix and last segment if possible
+ */
+function shortenToolName(name: string): string {
+  if (name.length <= TOOL_NAME_LIMIT) return name;
+  
+  // Try to preserve mcp__ prefix and last segment
+  if (name.startsWith('mcp__')) {
+    const lastDoubleUnderscore = name.lastIndexOf('__');
+    if (lastDoubleUnderscore > 0) {
+      const candidate = 'mcp__' + name.substring(lastDoubleUnderscore + 2);
+      if (candidate.length <= TOOL_NAME_LIMIT) return candidate;
+      return candidate.substring(0, TOOL_NAME_LIMIT);
+    }
+  }
+  
+  return name.substring(0, TOOL_NAME_LIMIT);
+}
+
+/**
+ * Build short name map ensuring uniqueness
+ */
+function buildShortNameMap(originalNames: string[]): Map<string, string> {
+  const used = new Set<string>();
+  const map = new Map<string, string>();
+  
+  for (const name of originalNames) {
+    let candidate = shortenToolName(name);
+    let finalName = candidate;
+    let counter = 1;
+    
+    // Ensure uniqueness
+    while (used.has(finalName)) {
+      const suffix = '_' + counter;
+      const allowed = TOOL_NAME_LIMIT - suffix.length;
+      finalName = candidate.substring(0, Math.max(0, allowed)) + suffix;
+      counter++;
+    }
+    
+    used.add(finalName);
+    map.set(name, finalName);
+  }
+  
+  return map;
+}
+
 /**
  * Convert OpenAI chat messages to Codex Responses API input format.
+ * Handles tool name shortening and multimodal content.
  */
-function convertToResponsesInput(messages: any[]): any[] {
+function convertToResponsesInput(messages: any[], shortNameMap: Map<string, string>): any[] {
   const input: any[] = [];
+  
+  // Track call IDs for pairing function calls with outputs
+  const pendingCallIds: string[] = [];
+  
   for (const msg of messages) {
     if (msg.role === 'system') continue; // handled as instructions
+    
     if (msg.role === 'user') {
-      input.push({ role: 'user', content: msg.content });
+      // Handle multimodal content
+      if (Array.isArray(msg.content)) {
+        const content: any[] = [];
+        for (const item of msg.content) {
+          if (item.type === 'text') {
+            content.push({ type: 'input_text', text: item.text });
+          } else if (item.type === 'image_url') {
+            // Codex doesn't support images directly, skip or convert to text reference
+            content.push({ type: 'input_text', text: '[Image]' });
+          }
+        }
+        if (content.length > 0) {
+          input.push({ role: 'user', content });
+        }
+      } else {
+        input.push({ role: 'user', content: msg.content });
+      }
     } else if (msg.role === 'assistant') {
+      // Handle tool calls first (they come before content in Responses API)
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
+          const shortName = shortNameMap.get(tc.function.name) || tc.function.name;
+          const callId = tc.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          pendingCallIds.push(callId);
           input.push({
             type: 'function_call',
-            name: tc.function.name,
+            name: shortName,
             arguments: tc.function.arguments,
-            call_id: tc.id,
+            call_id: callId,
           });
         }
       }
+      
+      // Then add text content
       if (msg.content) {
         input.push({ role: 'assistant', content: msg.content });
       }
     } else if (msg.role === 'tool') {
+      // Pair with the earliest pending call ID
+      const callId = pendingCallIds.length > 0 
+        ? pendingCallIds.shift() 
+        : msg.tool_call_id || `call_${Date.now()}`;
+      
       input.push({
         type: 'function_call_output',
-        call_id: msg.tool_call_id,
+        call_id: callId,
         output: msg.content,
       });
     }
   }
+  
   return input;
+}
+
+/**
+ * Process tool_choice with name shortening
+ */
+function processToolChoice(toolChoice: any, shortNameMap: Map<string, string>): any {
+  if (!toolChoice) return 'auto';
+  
+  if (typeof toolChoice === 'string') {
+    return toolChoice;
+  }
+  
+  if (toolChoice.type === 'function' && toolChoice.function?.name) {
+    const shortName = shortNameMap.get(toolChoice.function.name) || toolChoice.function.name;
+    return {
+      type: 'function',
+      name: shortName,
+    };
+  }
+  
+  return toolChoice;
 }
 
 export class CodexProvider implements Provider {
@@ -56,9 +160,22 @@ export class CodexProvider implements Provider {
 
     const codexConfig = getCodexOAuthConfig();
     const systemMsg = request.messages?.find((m: any) => m.role === 'system');
-    const input = convertToResponsesInput(request.messages || []);
+    
+    // Build tool name shortening map
+    const originalToolNames: string[] = [];
+    if (request.tools) {
+      for (const t of request.tools) {
+        if (t.type === 'function' && t.function?.name) {
+          originalToolNames.push(t.function.name);
+        }
+      }
+    }
+    const shortNameMap = buildShortNameMap(originalToolNames);
+    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
+    
+    const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
-    // Codex API 强制要求 stream: true，非流式场景需要读完整个流后拼出完整响应
+    // Codex API 强制要求 stream: true
     const body: any = {
       model,
       stream: true,
@@ -66,26 +183,34 @@ export class CodexProvider implements Provider {
       instructions: systemMsg?.content ?? '',
       store: false,
       parallel_tool_calls: true,
-      tool_choice: 'auto',
+      reasoning: {
+        effort: request.reasoning_effort || 'medium',
+        summary: 'auto',
+      },
+      include: ['reasoning.encrypted_content'],
     };
     
-    // Add tools if provided
+    // Add tools if provided (with shortened names)
     if (request.tools && request.tools.length > 0) {
       body.tools = request.tools
         .filter((t: any) => t.type === 'function')
-        .map((t: any) => ({
-          type: 'function',
-          name: t.function.name,
-          description: t.function.description || '',
-          parameters: t.function.parameters || { type: 'object', properties: {} },
-          strict: false,
-        }));
+        .map((t: any) => {
+          const shortName = shortNameMap.get(t.function.name) || t.function.name;
+          return {
+            type: 'function',
+            name: shortName,
+            description: t.function.description || '',
+            parameters: t.function.parameters || { type: 'object', properties: {} },
+            strict: false,
+          };
+        });
+      
+      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      
       if (body.tools.length === 0) {
         delete body.tools;
         delete body.tool_choice;
       }
-    } else {
-      delete body.tool_choice;
     }
 
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
@@ -118,6 +243,7 @@ export class CodexProvider implements Provider {
     let buffer = '';
     let currentEvent = '';
     let completedData: any = null;
+    let reasoningText = '';
 
     try {
       while (true) {
@@ -142,6 +268,10 @@ export class CodexProvider implements Provider {
             if (currentEvent === 'response.completed' || event.type === 'response.completed') {
               completedData = event.response || event;
             }
+            // Collect reasoning text
+            if (currentEvent === 'response.reasoning_summary_text.delta' || event.type === 'response.reasoning_summary_text.delta') {
+              reasoningText += event.delta || '';
+            }
           } catch { /* skip */ }
         }
       }
@@ -153,7 +283,7 @@ export class CodexProvider implements Provider {
       throw new Error('Codex 流未返回 response.completed 事件');
     }
 
-    return this.responsesApiToOpenAI(model, completedData);
+    return this.responsesApiToOpenAI(model, completedData, reverseMap, reasoningText);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
@@ -164,7 +294,20 @@ export class CodexProvider implements Provider {
 
     const codexConfig = getCodexOAuthConfig();
     const systemMsg = request.messages?.find((m: any) => m.role === 'system');
-    const input = convertToResponsesInput(request.messages || []);
+    
+    // Build tool name shortening map
+    const originalToolNames: string[] = [];
+    if (request.tools) {
+      for (const t of request.tools) {
+        if (t.type === 'function' && t.function?.name) {
+          originalToolNames.push(t.function.name);
+        }
+      }
+    }
+    const shortNameMap = buildShortNameMap(originalToolNames);
+    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
+    
+    const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
     const body: any = {
       model,
@@ -173,26 +316,34 @@ export class CodexProvider implements Provider {
       instructions: systemMsg?.content ?? '',
       store: false,
       parallel_tool_calls: true,
-      tool_choice: 'auto',
+      reasoning: {
+        effort: request.reasoning_effort || 'medium',
+        summary: 'auto',
+      },
+      include: ['reasoning.encrypted_content'],
     };
     
-    // Add tools if provided
+    // Add tools if provided (with shortened names)
     if (request.tools && request.tools.length > 0) {
       body.tools = request.tools
         .filter((t: any) => t.type === 'function')
-        .map((t: any) => ({
-          type: 'function',
-          name: t.function.name,
-          description: t.function.description || '',
-          parameters: t.function.parameters || { type: 'object', properties: {} },
-          strict: false,
-        }));
+        .map((t: any) => {
+          const shortName = shortNameMap.get(t.function.name) || t.function.name;
+          return {
+            type: 'function',
+            name: shortName,
+            description: t.function.description || '',
+            parameters: t.function.parameters || { type: 'object', properties: {} },
+            strict: false,
+          };
+        });
+      
+      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      
       if (body.tools.length === 0) {
         delete body.tools;
         delete body.tool_choice;
       }
-    } else {
-      delete body.tool_choice;
     }
 
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
@@ -227,6 +378,9 @@ export class CodexProvider implements Provider {
       const decoder = new TextDecoder();
       let buffer = '';
       let currentEvent = '';
+      let hasToolCalls = false;
+      // tool call index tracking removed
+      const toolCallBuffers: Map<number, { id: string; name: string; args: string }> = new Map();
 
       try {
         while (true) {
@@ -252,7 +406,9 @@ export class CodexProvider implements Provider {
 
             try {
               const event = JSON.parse(jsonStr);
-              if (currentEvent === 'response.output_text.delta' || event.type === 'response.output_text.delta') {
+              const eventType = event.type || currentEvent;
+              
+              if (eventType === 'response.output_text.delta') {
                 const text = event.delta || '';
                 if (text) {
                   yield {
@@ -267,7 +423,88 @@ export class CodexProvider implements Provider {
                     }],
                   };
                 }
-              } else if (currentEvent === 'response.completed' || currentEvent === 'response.done' || event.type === 'response.completed' || event.type === 'response.done') {
+              } else if (eventType === 'response.reasoning_summary_text.delta') {
+                // Yield reasoning content
+                const text = event.delta || '';
+                if (text) {
+                  yield {
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: timestamp,
+                    model,
+                    choices: [{
+                      index: 0,
+                      delta: { role: 'assistant', reasoning_content: text },
+                      finish_reason: null,
+                    }],
+                  };
+                }
+              } else if (eventType === 'response.function_call_arguments.delta') {
+                // Handle function call arguments streaming
+                hasToolCalls = true;
+                const tcIndex = event.item_index || 0;
+                
+                if (!toolCallBuffers.has(tcIndex)) {
+                  toolCallBuffers.set(tcIndex, {
+                    id: event.call_id || `call_${Date.now()}_${tcIndex}`,
+                    name: reverseMap.get(event.name) || event.name || '',
+                    args: '',
+                  });
+                  
+                  // Start new tool call
+                  yield {
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: timestamp,
+                    model,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        role: 'assistant',
+                        tool_calls: [{
+                          index: tcIndex,
+                          id: toolCallBuffers.get(tcIndex)!.id,
+                          type: 'function',
+                          function: {
+                            name: toolCallBuffers.get(tcIndex)!.name,
+                            arguments: '',
+                          },
+                        }],
+                      },
+                      finish_reason: null,
+                    }],
+                  };
+                }
+                
+                // Append arguments
+                const buf = toolCallBuffers.get(tcIndex)!;
+                if (event.delta) {
+                  buf.args += event.delta;
+                  yield {
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: timestamp,
+                    model,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        tool_calls: [{
+                          index: tcIndex,
+                          function: {
+                            arguments: event.delta,
+                          },
+                        }],
+                      },
+                      finish_reason: null,
+                    }],
+                  };
+                }
+              } else if (eventType === 'response.output_item.done') {
+                // Function call completed
+                if (event.item?.type === 'function_call') {
+                  hasToolCalls = true;
+                }
+              } else if (eventType === 'response.completed' || eventType === 'response.done') {
                 yield {
                   id: completionId,
                   object: 'chat.completion.chunk',
@@ -276,7 +513,7 @@ export class CodexProvider implements Provider {
                   choices: [{
                     index: 0,
                     delta: {},
-                    finish_reason: 'stop',
+                    finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
                   }],
                 };
               }
@@ -301,10 +538,19 @@ export class CodexProvider implements Provider {
   /**
    * Convert Responses API format to OpenAI chat completions format.
    */
-  private responsesApiToOpenAI(model: string, data: any): any {
+  private responsesApiToOpenAI(
+    model: string, 
+    data: any, 
+    reverseNameMap?: Map<string, string>,
+    reasoningText?: string
+  ): any {
     const choice: any = {
       index: 0,
-      message: { role: 'assistant', content: '' },
+      message: { 
+        role: 'assistant', 
+        content: '',
+        reasoning_content: reasoningText || null,
+      },
       finish_reason: 'stop',
     };
 
@@ -319,14 +565,19 @@ export class CodexProvider implements Provider {
             if (c.type === 'output_text') texts.push(c.text);
           }
         } else if (item.type === 'function_call') {
+          // Restore original tool name
+          const originalName = reverseNameMap?.get(item.name) || item.name;
           toolCalls.push({
             id: item.call_id || `call_${Date.now()}`,
             type: 'function',
             function: {
-              name: item.name,
+              name: originalName,
               arguments: item.arguments || '{}',
             },
           });
+        } else if (item.type === 'reasoning' && item.content) {
+          // Add reasoning content
+          choice.message.reasoning_content = item.content;
         }
       }
 
@@ -335,7 +586,7 @@ export class CodexProvider implements Provider {
         choice.message.tool_calls = toolCalls;
         choice.finish_reason = 'tool_calls';
       } else {
-        choice.message.content = texts.join('');
+        choice.message.content = texts.join('') || null;
       }
     }
 

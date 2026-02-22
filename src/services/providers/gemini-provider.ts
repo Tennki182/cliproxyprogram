@@ -83,27 +83,55 @@ export class GeminiProvider implements Provider {
   private toOpenAIResponse(model: string, response: any): any {
     const choice: any = {
       index: 0,
-      message: { role: 'assistant', content: '' },
+      message: { 
+        role: 'assistant', 
+        content: '',
+        reasoning_content: null,
+      },
       finish_reason: 'stop',
     };
 
     if (response.candidates?.[0]?.content?.parts) {
-      const textParts = response.candidates[0].content.parts.filter((p: any) => p.text);
+      const parts = response.candidates[0].content.parts;
+      
+      // Separate text and thought parts
+      const textParts: string[] = [];
+      const thoughtParts: string[] = [];
+      const toolCalls: any[] = [];
+      
+      for (const part of parts) {
+        if (part.text) {
+          if (part.thought) {
+            thoughtParts.push(part.text);
+          } else {
+            textParts.push(part.text);
+          }
+        } else if (part.functionCall) {
+          toolCalls.push({
+            id: `call_${Date.now()}_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: part.functionCall.name,
+              arguments: JSON.stringify(part.functionCall.args),
+            },
+          });
+        } else if (part.inlineData) {
+          // Handle image generation response
+          // This would need special handling for image data
+        }
+      }
+      
       if (textParts.length > 0) {
-        choice.message.content = textParts.map((p: any) => p.text).join('');
+        choice.message.content = textParts.join('');
+      }
+      
+      if (thoughtParts.length > 0) {
+        choice.message.reasoning_content = thoughtParts.join('');
       }
 
-      const toolCalls = response.candidates[0].content.parts.filter((p: any) => p.functionCall);
       if (toolCalls.length > 0) {
         choice.message.content = null;
-        choice.message.tool_calls = toolCalls.map((tc: any, i: number) => ({
-          id: `call_${Date.now()}_${i}`,
-          type: 'function',
-          function: {
-            name: tc.functionCall.name,
-            arguments: JSON.stringify(tc.functionCall.args),
-          },
-        }));
+        choice.message.tool_calls = toolCalls;
         choice.finish_reason = 'tool_calls';
       }
     }
@@ -126,26 +154,49 @@ export class GeminiProvider implements Provider {
   private toOpenAIChunk(model: string, chunk: any, id: string, created: number, index: number): any {
     const choice: any = {
       index: 0,
-      delta: { role: 'assistant', content: null },
+      delta: { 
+        role: 'assistant', 
+        content: null,
+        reasoning_content: null,
+      },
       finish_reason: null,
     };
 
     if (chunk.candidates?.[0]?.content?.parts) {
-      const textParts = chunk.candidates[0].content.parts.filter((p: any) => p.text);
+      const parts = chunk.candidates[0].content.parts;
+      const textParts: string[] = [];
+      const thoughtParts: string[] = [];
+      const toolCalls: any[] = [];
+      
+      for (const part of parts) {
+        if (part.text) {
+          if (part.thought) {
+            thoughtParts.push(part.text);
+          } else {
+            textParts.push(part.text);
+          }
+        } else if (part.functionCall) {
+          toolCalls.push({
+            id: `call_${index}_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: part.functionCall.name,
+              arguments: JSON.stringify(part.functionCall.args),
+            },
+          });
+        }
+      }
+      
       if (textParts.length > 0) {
-        choice.delta.content = textParts.map((p: any) => p.text).join('');
+        choice.delta.content = textParts.join('');
+      }
+      
+      if (thoughtParts.length > 0) {
+        choice.delta.reasoning_content = thoughtParts.join('');
       }
 
-      const toolCalls = chunk.candidates[0].content.parts.filter((p: any) => p.functionCall);
       if (toolCalls.length > 0) {
-        choice.delta.tool_calls = toolCalls.map((tc: any, i: number) => ({
-          id: `call_${index}_${i}`,
-          type: 'function',
-          function: {
-            name: tc.functionCall.name,
-            arguments: JSON.stringify(tc.functionCall.args),
-          },
-        }));
+        choice.delta.tool_calls = toolCalls;
       }
     }
 

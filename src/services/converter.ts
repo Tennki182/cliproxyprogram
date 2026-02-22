@@ -1,6 +1,5 @@
 import {
   OpenAIMessage,
-  OpenAIToolChoice,
   OpenAIChatCompletionRequest,
   OpenAIMessageContent,
 } from '../types/openai.js';
@@ -192,7 +191,7 @@ export function extractSystemInstruction(
 /**
  * Convert reasoning_effort to Gemini thinkingConfig
  */
-function convertReasoningEffort(effort?: 'low' | 'medium' | 'high'): GeminiThinkingConfig | undefined {
+function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'none'): GeminiThinkingConfig | undefined {
   if (!effort) return undefined;
   
   if (effort === 'auto') {
@@ -203,7 +202,7 @@ function convertReasoningEffort(effort?: 'low' | 'medium' | 'high'): GeminiThink
   }
   
   return {
-    thinkingLevel: effort,
+    thinkingLevel: effort === 'none' ? undefined : effort,
     includeThoughts: effort !== 'none',
   };
 }
