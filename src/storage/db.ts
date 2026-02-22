@@ -81,6 +81,18 @@ function initializeTables(): void {
     // Column already exists
   }
 
+  // Add token refresh tracking columns
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN next_refresh_after INTEGER DEFAULT 0`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN last_refreshed_at INTEGER DEFAULT 0`);
+  } catch {
+    // Column already exists
+  }
+
   // Migrate: drop old UNIQUE(account_id) constraint by rebuilding table.
   // SQLite inline UNIQUE cannot be dropped, must recreate table.
   try {
@@ -101,13 +113,17 @@ function initializeTables(): void {
         last_used_at INTEGER DEFAULT 0,
         rate_limited_until INTEGER DEFAULT 0,
         provider TEXT DEFAULT 'gemini',
-        proxy_url TEXT
+        proxy_url TEXT,
+        next_refresh_after INTEGER DEFAULT 0,
+        last_refreshed_at INTEGER DEFAULT 0
       )`);
       database.run(`INSERT OR IGNORE INTO credentials_new
         (id, account_id, access_token, refresh_token, expires_at, scope, project_id,
-         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url)
+         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url,
+         next_refresh_after, last_refreshed_at)
         SELECT id, account_id, access_token, refresh_token, expires_at, scope, project_id,
-         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url
+         created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url,
+         0, 0
         FROM credentials`);
       database.run(`DROP TABLE credentials`);
       database.run(`ALTER TABLE credentials_new RENAME TO credentials`);

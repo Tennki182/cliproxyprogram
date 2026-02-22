@@ -15,6 +15,8 @@ export interface Credential {
   rate_limited_until?: number;
   provider?: string;     // 'gemini' | 'codex' | 'iflow'
   proxy_url?: string;    // per-credential proxy override
+  next_refresh_after?: number;  // 下次允许刷新的时间戳（秒）
+  last_refreshed_at?: number;   // 上次成功刷新的时间戳（秒）
 }
 
 export function saveCredential(credential: Credential): void {
@@ -40,7 +42,9 @@ export function saveCredential(credential: Credential): void {
         scope = ?,
         project_id = ?,
         updated_at = ?,
-        provider = ?
+        provider = ?,
+        next_refresh_after = ?,
+        last_refreshed_at = ?
       WHERE account_id = ? AND provider = ?`,
       [
         credential.access_token,
@@ -50,6 +54,8 @@ export function saveCredential(credential: Credential): void {
         credential.project_id || null,
         now,
         provider,
+        credential.next_refresh_after || 0,
+        credential.last_refreshed_at || 0,
         credential.account_id,
         provider,
       ]
@@ -58,8 +64,8 @@ export function saveCredential(credential: Credential): void {
     // Insert
     db.run(
       `INSERT INTO credentials
-        (account_id, access_token, refresh_token, expires_at, scope, project_id, created_at, updated_at, provider)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (account_id, access_token, refresh_token, expires_at, scope, project_id, created_at, updated_at, provider, next_refresh_after, last_refreshed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         credential.account_id,
         credential.access_token,
@@ -70,6 +76,8 @@ export function saveCredential(credential: Credential): void {
         now,
         now,
         provider,
+        credential.next_refresh_after || 0,
+        credential.last_refreshed_at || 0,
       ]
     );
   }
@@ -238,6 +246,53 @@ export function clearRateLimit(accountId: string, provider?: string): void {
     db.run(
       `UPDATE credentials SET rate_limited_until = 0 WHERE account_id = ?`,
       [accountId]
+    );
+  }
+  saveDatabase();
+}
+
+/**
+ * Set next_refresh_after to prevent immediate retry after refresh failure.
+ * @param accountId Account ID
+ * @param nextRefreshAfter Epoch seconds when next refresh is allowed
+ * @param provider Provider identifier
+ */
+export function setNextRefreshAfter(accountId: string, nextRefreshAfter: number, provider?: string): void {
+  const db = getDatabase();
+
+  if (provider) {
+    db.run(
+      `UPDATE credentials SET next_refresh_after = ? WHERE account_id = ? AND provider = ?`,
+      [nextRefreshAfter, accountId, provider]
+    );
+  } else {
+    db.run(
+      `UPDATE credentials SET next_refresh_after = ? WHERE account_id = ?`,
+      [nextRefreshAfter, accountId]
+    );
+  }
+  saveDatabase();
+}
+
+/**
+ * Set last_refreshed_at to record successful refresh time.
+ * Also clears next_refresh_after to allow normal refresh scheduling.
+ * @param accountId Account ID
+ * @param lastRefreshedAt Epoch seconds of successful refresh
+ * @param provider Provider identifier
+ */
+export function setLastRefreshedAt(accountId: string, lastRefreshedAt: number, provider?: string): void {
+  const db = getDatabase();
+
+  if (provider) {
+    db.run(
+      `UPDATE credentials SET last_refreshed_at = ?, next_refresh_after = 0 WHERE account_id = ? AND provider = ?`,
+      [lastRefreshedAt, accountId, provider]
+    );
+  } else {
+    db.run(
+      `UPDATE credentials SET last_refreshed_at = ?, next_refresh_after = 0 WHERE account_id = ?`,
+      [lastRefreshedAt, accountId]
     );
   }
   saveDatabase();

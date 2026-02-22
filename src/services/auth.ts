@@ -108,7 +108,7 @@ export async function discoverProject(accessToken: string): Promise<string> {
   };
 
   const metadata = {
-    ideType: 'ANTIGRAVITY',
+    ideType: 'IDE_UNSPECIFIED',
     platform: 'PLATFORM_UNSPECIFIED',
     pluginType: 'GEMINI',
   };
@@ -199,8 +199,9 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
     }
   }
 
+  const now = Date.now();
   const expiresAt = tokens.expires_in
-    ? Date.now() + tokens.expires_in * 1000
+    ? now + tokens.expires_in * 1000
     : undefined;
 
   const geminiConfig = getGeminiOAuthConfig();
@@ -212,6 +213,8 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
     scope: tokens.scope || geminiConfig.scopes.join(' '),
     project_id: projectId,
     provider: 'gemini',
+    last_refreshed_at: Math.floor(now / 1000),
+    next_refresh_after: 0, // Clear any pending backoff
   };
 
   saveCredential(credential);
@@ -305,8 +308,9 @@ export async function refreshCodexToken(refreshToken: string, accountId: string)
     throw new Error('Failed to refresh Codex token: ' + (tokens.error_description || tokens.error || 'unknown error'));
   }
 
+  const now = Date.now();
   const expiresAt = tokens.expires_in
-    ? Date.now() + tokens.expires_in * 1000
+    ? now + tokens.expires_in * 1000
     : undefined;
 
   const credential: Credential = {
@@ -316,6 +320,8 @@ export async function refreshCodexToken(refreshToken: string, accountId: string)
     expires_at: expiresAt,
     scope: tokens.scope || 'openid email profile offline_access',
     provider: 'codex',
+    last_refreshed_at: Math.floor(now / 1000),
+    next_refresh_after: 0, // Clear any pending backoff
   };
 
   saveCredential(credential);
@@ -365,8 +371,9 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
   const apiKey = userInfo.data.apiKey;
   const email = userInfo.data.email || userInfo.data.phone || accountId;
 
+  const now = Date.now();
   const expiresAt = tokens.expires_in
-    ? Date.now() + tokens.expires_in * 1000
+    ? now + tokens.expires_in * 1000
     : undefined;
 
   const credential: Credential = {
@@ -376,6 +383,8 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
     expires_at: expiresAt,
     scope: tokens.scope || '',
     provider: 'iflow',
+    last_refreshed_at: Math.floor(now / 1000),
+    next_refresh_after: 0, // Clear any pending backoff
   };
 
   saveCredential(credential);
