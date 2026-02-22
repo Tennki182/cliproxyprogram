@@ -32,8 +32,8 @@ function getApiUrl(method: string): string {
   return `${config.gemini.apiEndpoint}:${method}`;
 }
 
-async function getCredential(): Promise<{ accessToken: string; projectId: string; accountId: string }> {
-  const credential = await acquireCredential();
+async function getCredential(): Promise<{ accessToken: string; projectId: string; accountId: string; credential: any }> {
+  const credential = await acquireCredential({ provider: 'gemini' });
   if (!credential) {
     throw new Error('未登录，请先通过 /auth/login 认证');
   }
@@ -44,6 +44,7 @@ async function getCredential(): Promise<{ accessToken: string; projectId: string
     accessToken: credential.access_token,
     projectId: credential.project_id,
     accountId: credential.account_id,
+    credential,
   };
 }
 

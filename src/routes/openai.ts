@@ -3,8 +3,10 @@ import { OpenAIChatCompletionRequest } from '../types/openai.js';
 import { getProviderForRequest } from '../services/provider-factory.js';
 import { enqueue } from '../services/queue.js';
 import { recordRequest } from './management.js';
+import { recordUsage } from '../services/usage.js';
 import { logReq, logError } from '../services/log-stream.js';
 import { createSSEKeepAlive } from '../services/sse-utils.js';
+import { acquireCredential } from '../services/rotation.js';
 
 export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
   /**
@@ -53,6 +55,9 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
       const stream = body.stream;
       logReq(`OpenAI ${stream ? 'stream' : 'req'} → ${provider.name}/${model}`, { format: 'openai', model, stream });
 
+      // Get credential for usage tracking
+      const credential = await acquireCredential({ provider: provider.name });
+
       // Handle streaming
       if (body.stream) {
         try {
@@ -65,10 +70,21 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
           });
 
           const clearKeepAlive = createSSEKeepAlive(reply);
+          
+          // Track usage for streaming
+          let inputTokens = 0;
+          let outputTokens = 0;
+          let hasError = false;
 
           try {
             for await (const chunk of stream) {
               reply.raw.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              
+              // Extract usage from chunk if available
+              if (chunk.usage) {
+                inputTokens = chunk.usage.prompt_tokens || inputTokens;
+                outputTokens = chunk.usage.completion_tokens || outputTokens;
+              }
             }
           } finally {
             clearKeepAlive();
@@ -77,11 +93,26 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
           reply.raw.write('data: [DONE]\n\n');
           reply.raw.end();
 
+          // Record usage
+          if (credential) {
+            recordUsage(credential, model, {
+              inputTokens,
+              outputTokens,
+              totalTokens: inputTokens + outputTokens,
+            }, !hasError);
+          }
+
           recordRequest(true);
           return reply;
         } catch (error: any) {
           fastify.log.error(error);
           recordRequest(false);
+          
+          // Record failed usage
+          if (credential) {
+            recordUsage(credential, model, {}, false, error.message);
+          }
+          
           logError(`OpenAI stream 失败: ${error.message}`, { model });
           // If headers already sent, can't reply with JSON
           if (reply.raw.headersSent) {
@@ -99,10 +130,27 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const response = await enqueue(() => provider.chatCompletion(model, body));
         recordRequest(true);
+        
+        // Record usage from response
+        if (credential && response) {
+          const usage = response.usage || {};
+          recordUsage(credential, model, {
+            inputTokens: usage.prompt_tokens,
+            outputTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+          }, true);
+        }
+        
         return reply.send(response);
       } catch (error: any) {
         fastify.log.error(error);
         recordRequest(false);
+        
+        // Record failed usage
+        if (credential) {
+          recordUsage(credential, model, {}, false, error.message);
+        }
+        
         logError(`OpenAI req 失败: ${error.message}`, { model });
         return reply.status(500).send({
           error: {

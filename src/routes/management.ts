@@ -8,8 +8,9 @@ import { resetProviders } from '../services/provider-factory.js';
 import { resetBackend } from '../services/backend-factory.js';
 import { resetHttpDispatchers } from '../services/http.js';
 import { getRecentLogs, onLog, LogEntry } from '../services/log-stream.js';
+import { getUsageStats } from '../services/usage.js';
 
-// Simple usage stats (in-memory)
+// Simple usage stats (in-memory) - kept for backward compatibility
 let stats = {
   totalRequests: 0,
   successfulRequests: 0,
@@ -53,34 +54,43 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
   fastify.get('/v0/management/accounts', async () => {
     const credentials = listCredentials();
     const now = Math.floor(Date.now() / 1000);
+    const usageStats = getUsageStats();
 
     return {
-      accounts: credentials.map(c => ({
-        account_id: c.account_id,
-        provider: c.provider || 'gemini',
-        project_id: c.project_id,
-        has_refresh_token: !!c.refresh_token,
-        is_expired: !!(c.expires_at && c.expires_at < Date.now()),
-        is_rate_limited: !!(c.rate_limited_until && c.rate_limited_until > now),
-        rate_limited_until: c.rate_limited_until || 0,
-        last_used_at: c.last_used_at || 0,
-        proxy_url: c.proxy_url || null,
-      })),
+      accounts: credentials.map(c => {
+        const todayStats = usageStats.getTodayStatsForCredential(c.account_id, c.provider || 'gemini');
+        return {
+          account_id: c.account_id,
+          provider: c.provider || 'gemini',
+          project_id: c.project_id,
+          has_refresh_token: !!c.refresh_token,
+          is_expired: !!(c.expires_at && c.expires_at < Date.now()),
+          is_rate_limited: !!(c.rate_limited_until && c.rate_limited_until > now),
+          rate_limited_until: c.rate_limited_until || 0,
+          last_used_at: c.last_used_at || 0,
+          proxy_url: c.proxy_url || null,
+          today_requests: todayStats.totalRequests,
+          today_tokens: todayStats.totalTokens,
+        };
+      }),
     };
   });
 
   /**
-   * GET /v0/management/stats — Usage statistics
+   * GET /v0/management/stats — Basic usage statistics (backward compatible)
    */
   fastify.get('/v0/management/stats', async () => {
     const queue = getQueueStats();
     const config = getConfig();
+    const usageStats = getUsageStats();
+    const globalStats = usageStats.getGlobalStats();
 
     return {
       uptime_seconds: Math.floor((Date.now() - stats.startedAt) / 1000),
-      total_requests: stats.totalRequests,
-      successful_requests: stats.successfulRequests,
-      failed_requests: stats.failedRequests,
+      total_requests: globalStats.totalRequests,
+      successful_requests: globalStats.successCount,
+      failed_requests: globalStats.failureCount,
+      total_tokens: globalStats.totalTokens,
       queue: {
         pending: queue.pending,
         running: queue.running,
@@ -92,6 +102,62 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
         codex: config.codex.enabled,
         iflow: config.iflow.enabled,
       },
+    };
+  });
+
+  /**
+   * GET /v0/management/usage — Detailed usage statistics
+   */
+  fastify.get('/v0/management/usage', async () => {
+    const usageStats = getUsageStats();
+    
+    return {
+      global: usageStats.getGlobalStats(),
+      credentials: usageStats.getCredentialStats(),
+      daily: usageStats.getDailyStats(30),
+      hourly: usageStats.getHourlyStats(),
+    };
+  });
+
+  /**
+   * GET /v0/management/usage/credentials — Stats grouped by credential
+   */
+  fastify.get('/v0/management/usage/credentials', async () => {
+    const usageStats = getUsageStats();
+    return {
+      credentials: usageStats.getCredentialStats(),
+    };
+  });
+
+  /**
+   * GET /v0/management/usage/daily — Daily stats for last N days
+   */
+  fastify.get<{ Querystring: { days?: string } }>('/v0/management/usage/daily', async (request) => {
+    const days = parseInt(request.query.days || '30', 10);
+    const usageStats = getUsageStats();
+    return {
+      daily: usageStats.getDailyStats(days),
+    };
+  });
+
+  /**
+   * GET /v0/management/usage/hourly — Today's hourly stats
+   */
+  fastify.get('/v0/management/usage/hourly', async () => {
+    const usageStats = getUsageStats();
+    return {
+      hourly: usageStats.getHourlyStats(),
+    };
+  });
+
+  /**
+   * GET /v0/management/history — Recent request history
+   */
+  fastify.get<{ Querystring: { limit?: string } }>('/v0/management/history', async (request) => {
+    const limit = parseInt(request.query.limit || '100', 10);
+    const usageStats = getUsageStats();
+    return {
+      history: usageStats.getRequestHistory(limit),
     };
   });
 
