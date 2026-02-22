@@ -35,6 +35,7 @@ export async function createServer(): Promise<FastifyInstance> {
     logger: {
       level: config.logging.level,
     },
+    trustProxy: true, // Trust reverse proxy headers (X-Forwarded-Proto, X-Forwarded-Host)
     ...httpsOptions,
   });
 
