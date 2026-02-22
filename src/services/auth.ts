@@ -152,8 +152,15 @@ export async function discoverProject(accessToken: string): Promise<string> {
 
 /**
  * Refresh access token using refresh token
+ * @param refreshToken The refresh token
+ * @param accountId The account ID (to identify which credential to update)
+ * @param projectId The existing project ID (to preserve it)
  */
-export async function refreshAccessToken(refreshToken: string): Promise<Credential> {
+export async function refreshAccessToken(
+  refreshToken: string, 
+  accountId?: string, 
+  projectId?: string
+): Promise<Credential> {
   const config = getGeminiOAuthConfig();
   const response = await pfetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
@@ -174,26 +181,38 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
     throw new Error('Failed to refresh token');
   }
 
-  // Get user info for account ID
-  let accountId = `account_${Date.now()}`;
+  // Get user info for account ID if not provided
+  let resolvedAccountId = accountId || `account_${Date.now()}`;
   let email: string | undefined;
-  try {
-    const userInfoResponse = await pfetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-    });
-    const userInfo = await userInfoResponse.json() as any;
-    accountId = userInfo.id || accountId;
-    email = userInfo.email;
-  } catch {
-    // Ignore errors
+  if (!accountId) {
+    try {
+      const userInfoResponse = await pfetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+      });
+      const userInfo = await userInfoResponse.json() as any;
+      resolvedAccountId = userInfo.id || resolvedAccountId;
+      email = userInfo.email;
+    } catch {
+      // Ignore errors
+    }
+  } else {
+    // Use provided accountId, but try to get email for display
+    try {
+      const userInfoResponse = await pfetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+      });
+      const userInfo = await userInfoResponse.json() as any;
+      email = userInfo.email;
+    } catch {
+      // Ignore errors
+    }
   }
 
-  // Try to discover project if not already known
-  const existingCredential = getActiveCredential();
-  let projectId = existingCredential?.project_id;
-  if (!projectId) {
+  // Use provided project_id or try to discover if not available
+  let resolvedProjectId = projectId;
+  if (!resolvedProjectId) {
     try {
-      projectId = await discoverProject(tokens.access_token);
+      resolvedProjectId = await discoverProject(tokens.access_token);
     } catch {
       // Ignore
     }
@@ -206,12 +225,12 @@ export async function refreshAccessToken(refreshToken: string): Promise<Credenti
 
   const geminiConfig = getGeminiOAuthConfig();
   const credential: Credential = {
-    account_id: email || existingCredential?.account_id || accountId,
+    account_id: email || resolvedAccountId,
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token || refreshToken,
     expires_at: expiresAt,
     scope: tokens.scope || geminiConfig.scopes.join(' '),
-    project_id: projectId,
+    project_id: resolvedProjectId,
     provider: 'gemini',
     last_refreshed_at: Math.floor(now / 1000),
     next_refresh_after: 0, // Clear any pending backoff
@@ -274,7 +293,8 @@ export async function ensureValidCredentials(): Promise<Credential | null> {
 
   if (credential.expires_at && credential.expires_at < Date.now() && credential.refresh_token) {
     try {
-      return await refreshAccessToken(credential.refresh_token);
+      // Pass account_id and project_id to preserve them during refresh
+      return await refreshAccessToken(credential.refresh_token, credential.account_id, credential.project_id);
     } catch (error) {
       console.error('Failed to refresh token:', error);
       return null;
@@ -413,7 +433,8 @@ export async function getValidCredential(provider: string): Promise<Credential |
         } else if (provider === 'iflow') {
           return await refreshIFlowToken(cred.refresh_token, cred.account_id);
         } else if (provider === 'gemini') {
-          return await refreshAccessToken(cred.refresh_token);
+          // Pass account_id and project_id to preserve them during refresh
+          return await refreshAccessToken(cred.refresh_token, cred.account_id, cred.project_id);
         }
       } catch {
         // Refresh failed, continue to next credential

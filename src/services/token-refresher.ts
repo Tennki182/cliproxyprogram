@@ -130,7 +130,8 @@ async function refreshCredential(cred: Credential): Promise<void> {
     } else if (provider === 'iflow') {
       await refreshIFlowToken(cred.refresh_token!, cred.account_id);
     } else {
-      await refreshAccessToken(cred.refresh_token!);
+      // Pass account_id and project_id to preserve them during refresh
+      await refreshAccessToken(cred.refresh_token!, cred.account_id, cred.project_id);
     }
     
     handleRefreshSuccess(cred);

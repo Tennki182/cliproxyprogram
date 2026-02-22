@@ -1,21 +1,61 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ProxyCLI - Docker Compose Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
 services:
+  # ── Main Application ─────────────────────────────────────────────────────────
   proxycli:
     build:
       context: .
       dockerfile: Dockerfile
+      target: production
+      args:
+        - NODE_ENV=production
     image: proxycli:latest
     container_name: proxycli
+    
+    # Ports
     ports:
-      - "8488:8488"
-    volumes:
-      # Persistent database + session files
-      - ./data:/app/data
-      # Config file (edit on host, writable inside container)
-      - ./config.yaml:/app/config.yaml
+      - "${PROXYCLI_PORT:-8488}:8488"
+    
+    # Environment variables
     environment:
       - NODE_ENV=production
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
+      # Optional: set log level (trace, debug, info, warn, error, fatal)
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    
+    # Volumes
+    volumes:
+      # Persistent database and session files
+      - type: bind
+        source: ./data
+        target: /app/data
+      # Config file - read-only for safety
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+      # Optional: SSL certificates
+      - type: bind
+        source: ./certs
+        target: /app/certs
+        read_only: true
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '${PROXYCLI_CPU_LIMIT:-1}'
+          memory: ${PROXYCLI_MEMORY_LIMIT:-512M}
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    
+    # Restart policy
     restart: unless-stopped
+    
+    # Health check
     healthcheck:
       test:
         - CMD
@@ -23,6 +63,59 @@ services:
         - -e
         - "fetch('http://localhost:8488/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
       start_period: 15s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service_name,environment"
+        env: "OS_VERSION"
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    
+    # Read-only root filesystem for security
+    read_only: true
+    
+    # Temporary filesystems for writable areas
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    
+    # Networks
+    networks:
+      - proxycli-network
+    
+    # Labels
+    labels:
+      - "com.proxycli.service=main"
+      - "com.proxycli.environment=production"
+
+  # ── Optional: Watchtower for auto-updates ────────────────────────────────────
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - WATCHTOWER_CLEANUP=true
+  #     - WATCHTOWER_POLL_INTERVAL=3600
+  #   restart: unless-stopped
+
+# ── Networks ───────────────────────────────────────────────────────────────────
+networks:
+  proxycli-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.0.0/16
+
+# ── Volumes (if using named volumes instead of bind mounts) ────────────────────
+# volumes:
+#   proxycli-data:
+#     driver: local

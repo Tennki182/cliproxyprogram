@@ -1,10 +1,103 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ProxyCLI - Docker Ignore
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Dependencies
 node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build output
 dist
+build
 .tmp
-browsers
-data
+temp
+
+# Git
 .git
 .gitignore
-.env
-*.log
+.gitattributes
+.gitmodules
+
+# Docker
+Dockerfile*
 docker-compose*.yml
+.dockerignore
+
+# Keep entrypoint script
+!docker-entrypoint.sh
+
+# Documentation
+*.md
+LICENSE
+CHANGELOG
+CHANGELOG.md
+CHANGES.md
+CLAUDE.md
+docs/
+
+# IDE and editors
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+
+# Testing
+coverage
+.nyc_output
+*.test.ts
+*.spec.ts
+tests/
+test/
+__tests__/
+
+# Data (will be mounted as volume)
+data/
+data/**/*
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Optional: exclude these if they exist
+browsers/
+certs/*.pem
+certs/*.key
+certs/*.crt
+!certs/.gitkeep
+
+# TypeScript cache
+*.tsbuildinfo
+
+# ESLint cache
+.eslintcache
+
+# Package manager caches
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*

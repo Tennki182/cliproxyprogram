@@ -96,6 +96,7 @@ function go(page) {
   if (page === 'manage') loadCredentials();
   if (page === 'logs') startLogStream();
   if (page === 'stats') { loadUsageStats(); loadRequestHistory(); }
+  if (page === 'providers') loadProviders();
 }
 
 async function rpc(ep, opts = {}) {
@@ -322,6 +323,7 @@ async function loadModels() {
   sel.innerHTML = activeModels.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('');
 
   renderModels();
+  renderModelFilters();
 }
 
 function renderModels() {
@@ -341,16 +343,18 @@ function renderModels() {
   });
 
   let html = '';
-  const order = ['gemini', 'codex', 'iflow'];
-  const labels = { gemini: 'Gemini', codex: 'Codex', iflow: 'iFlow' };
+  // Built-in providers with fixed order
+  const builtinOrder = ['gemini', 'codex', 'iflow'];
+  const builtinLabels = { gemini: 'Gemini', codex: 'Codex', iflow: 'iFlow' };
 
-  order.forEach(p => {
+  // Render built-in providers first
+  builtinOrder.forEach(p => {
     if (!groups[p]) return;
     const activeCount = groups[p].filter(m => !m.x_excluded).length;
     const totalCount = groups[p].length;
     const countLabel = showExcluded && activeCount !== totalCount ? `${activeCount}/${totalCount}` : `${totalCount}`;
     html += `<div style="margin-bottom: 20px;">
-      <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;">${labels[p]} · ${countLabel} 个模型</div>`;
+      <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;">${builtinLabels[p]} · ${countLabel} 个模型</div>`;
     groups[p].forEach(m => {
       const isExcluded = !!m.x_excluded;
       const excludedClass = isExcluded ? ' excluded' : '';
@@ -363,14 +367,91 @@ function renderModels() {
       html += `<div class="model-item${excludedClass}" onclick="selectModel('${esc(m.id)}')">
         <span class="model-name">${esc(m.id)}${excludedTag}</span>
         <span style="display:flex;align-items:center;gap:6px;">
-          <span class="model-badge ${p}">${labels[p]}</span>
+          <span class="model-badge ${p}">${builtinLabels[p]}</span>
           <button class="model-hide-btn" onclick="event.stopPropagation();toggleModelExclude('${esc(provider)}','${esc(modelName)}','${actionType}')">${actionLabel}</button>
         </span>
       </div>`;
     });
     html += '</div>';
   });
+
+  // Render OpenAI-compatible providers
+  Object.keys(groups).forEach(p => {
+    if (builtinOrder.includes(p)) return; // Skip built-in providers
+    const activeCount = groups[p].filter(m => !m.x_excluded).length;
+    const totalCount = groups[p].length;
+    const countLabel = showExcluded && activeCount !== totalCount ? `${activeCount}/${totalCount}` : `${totalCount}`;
+    const displayName = p.charAt(0).toUpperCase() + p.slice(1);
+    html += `<div style="margin-bottom: 20px;">
+      <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;">${displayName} · ${countLabel} 个模型</div>`;
+    groups[p].forEach(m => {
+      const isExcluded = !!m.x_excluded;
+      const excludedClass = isExcluded ? ' excluded' : '';
+      const modelName = m.id.includes('/') ? m.id.split('/').slice(1).join('/') : m.id;
+      const provider = m.x_provider || 'gemini';
+      const actionLabel = isExcluded ? '显示' : '隐藏';
+      const actionType = isExcluded ? 'remove' : 'add';
+      const excludedTag = isExcluded ? ' <span style="font-size:10px;color:var(--accent-warning);">(已隐藏)</span>' : '';
+      html += `<div class="model-item${excludedClass}" onclick="selectModel('${esc(m.id)}')">
+        <span class="model-name">${esc(m.id)}${excludedTag}</span>
+        <span style="display:flex;align-items:center;gap:6px;">
+          <span class="model-badge openai-compat">${displayName}</span>
+          <button class="model-hide-btn" onclick="event.stopPropagation();toggleModelExclude('${esc(provider)}','${esc(modelName)}','${actionType}')">${actionLabel}</button>
+        </span>
+      </div>`;
+    });
+    html += '</div>';
+  });
+
   list.innerHTML = html;
+}
+
+/**
+ * Dynamically render model filter tabs based on available providers.
+ */
+function renderModelFilters() {
+  const filterContainer = $('modelFilter');
+  if (!filterContainer) return;
+
+  // Get unique providers from models
+  const providers = new Set();
+  allModels.forEach(m => {
+    providers.add(m.x_provider || 'gemini');
+  });
+
+  // Build filter tabs
+  let html = '<div class="protocol-tab active" data-pf="all" onclick="filterModels(\'all\')">全部</div>';
+  
+  // Built-in providers
+  const builtinOrder = ['gemini', 'codex', 'iflow'];
+  const builtinLabels = { gemini: 'Gemini', codex: 'Codex', iflow: 'iFlow' };
+  
+  builtinOrder.forEach(p => {
+    if (providers.has(p)) {
+      html += `<div class="protocol-tab" data-pf="${p}" onclick="filterModels('${p}')">${builtinLabels[p]}</div>`;
+    }
+  });
+
+  // OpenAI-compatible providers
+  providers.forEach(p => {
+    if (!builtinOrder.includes(p)) {
+      const displayName = p.charAt(0).toUpperCase() + p.slice(1);
+      html += `<div class="protocol-tab" data-pf="${p}" onclick="filterModels('${p}')">${displayName}</div>`;
+    }
+  });
+
+  // Add "show excluded" checkbox at the end
+  html += `<label style="margin-left:auto;font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="showExcluded" onchange="toggleShowExcluded()" style="accent-color:var(--accent-primary);">
+    显示隐藏模型
+  </label>`;
+
+  filterContainer.innerHTML = html;
+  
+  // Restore active state
+  document.querySelectorAll('#modelFilter .protocol-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.pf === modelFilter);
+  });
 }
 
 function filterModels(f) {
@@ -973,3 +1054,449 @@ function formatNumber(num) {
   return num.toString();
 }
 
+
+// ========== OpenAI Compatible Provider Management ==========
+
+let currentProviderName = null;
+let currentProviderModels = [];
+
+async function loadProviders() {
+  try {
+    const r = await rpc('/v0/management/openai-compat/providers');
+    if (!r.ok) {
+      $('providerList').innerHTML = `<div class="empty-state"><p>加载失败: ${r.data?.error || '未知错误'}</p></div>`;
+      return;
+    }
+    
+    const providers = r.data?.providers || [];
+    renderProviders(providers);
+  } catch (e) {
+    $('providerList').innerHTML = `<div class="empty-state"><p>加载失败: ${e.message}</p></div>`;
+  }
+}
+
+function renderProviders(providers) {
+  const container = $('providerList');
+  
+  if (!providers || providers.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>
+        </svg>
+        <p>暂无 OpenAI 兼容 Provider</p>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:8px;">点击右上角按钮添加</p>
+      </div>`;
+    return;
+  }
+
+  let html = '<div style="display:grid;gap:16px;">';
+  
+  providers.forEach(p => {
+    const statusClass = p.enabled ? 'success' : 'error';
+    const statusText = p.enabled ? '启用' : '禁用';
+    
+    html += `
+      <div class="provider-card-item" style="background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:20px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+          <div>
+            <h4 style="font-size:16px;font-weight:600;margin-bottom:4px;">${esc(p.name)}</h4>
+            <p style="font-size:12px;color:var(--text-muted);">${esc(p.baseUrl)}</p>
+          </div>
+          <span class="status-badge ${statusClass}">${statusText}</span>
+        </div>
+        
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          ${p.prefix ? `<span class="model-badge" style="font-size:11px;">前缀: ${esc(p.prefix)}</span>` : ''}
+          <span class="model-badge openai-compat" style="font-size:11px;">API Key: ${esc(p.apiKey)}</span>
+        </div>
+        
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-secondary btn-sm" onclick="editProvider('${esc(p.name)}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:4px;">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+            编辑
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="manageProviderModels('${esc(p.name)}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:4px;">
+              <path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>
+            </svg>
+            模型
+          </button>
+          <button class="btn btn-icon btn-sm" onclick="deleteProvider('${esc(p.name)}')" title="删除" style="margin-left:auto;color:var(--accent-error);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+              <path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    `;
+  });
+  
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// Provider Modal
+function showAddProviderModal() {
+  currentProviderName = null;
+  $('providerModalTitle').textContent = '添加 Provider';
+  $('providerName').value = '';
+  $('providerName').disabled = false;
+  $('providerBaseUrl').value = '';
+  $('providerApiKey').value = '';
+  $('providerPrefix').value = '';
+  $('providerHeaders').value = '';
+  $('providerError').style.display = 'none';
+  $('providerSubmitBtn').textContent = '保存';
+  $('providerModal').style.display = 'flex';
+}
+
+async function editProvider(name) {
+  currentProviderName = name;
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(name)}`);
+    if (!r.ok) {
+      toast('获取 Provider 信息失败', 'error');
+      return;
+    }
+    
+    const p = r.data?.provider;
+    if (!p) {
+      toast('Provider 不存在', 'error');
+      return;
+    }
+    
+    $('providerModalTitle').textContent = '编辑 Provider';
+    $('providerName').value = p.name;
+    $('providerName').disabled = true;
+    $('providerBaseUrl').value = p.baseUrl;
+    $('providerApiKey').value = ''; // Don't show masked key
+    $('providerApiKey').placeholder = '留空表示不修改';
+    $('providerPrefix').value = p.prefix || '';
+    $('providerHeaders').value = JSON.stringify(p.headers || {}, null, 2);
+    $('providerError').style.display = 'none';
+    $('providerSubmitBtn').textContent = '更新';
+    $('providerModal').style.display = 'flex';
+  } catch (e) {
+    toast('加载失败: ' + e.message, 'error');
+  }
+}
+
+function closeProviderModal() {
+  $('providerModal').style.display = 'none';
+  currentProviderName = null;
+}
+
+async function submitProvider() {
+  const name = $('providerName').value.trim();
+  const baseUrl = $('providerBaseUrl').value.trim();
+  const apiKey = $('providerApiKey').value.trim();
+  const prefix = $('providerPrefix').value.trim();
+  const headersStr = $('providerHeaders').value.trim();
+  
+  // Validation
+  if (!currentProviderName) {
+    if (!name) {
+      $('providerError').textContent = '请输入名称';
+      $('providerError').style.display = 'block';
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      $('providerError').textContent = '名称只能包含字母、数字、下划线和横线';
+      $('providerError').style.display = 'block';
+      return;
+    }
+  }
+  
+  if (!baseUrl) {
+    $('providerError').textContent = '请输入 Base URL';
+    $('providerError').style.display = 'block';
+    return;
+  }
+  
+  if (!currentProviderName && !apiKey) {
+    $('providerError').textContent = '请输入 API Key';
+    $('providerError').style.display = 'block';
+    return;
+  }
+  
+  let headers = {};
+  if (headersStr) {
+    try {
+      headers = JSON.parse(headersStr);
+    } catch (e) {
+      $('providerError').textContent = 'Headers JSON 格式错误';
+      $('providerError').style.display = 'block';
+      return;
+    }
+  }
+  
+  $('providerError').style.display = 'none';
+  $('providerSubmitBtn').disabled = true;
+  $('providerSubmitBtn').textContent = currentProviderName ? '更新中...' : '保存中...';
+  
+  try {
+    if (currentProviderName) {
+      // Update existing
+      const updates = { baseUrl, prefix: prefix || undefined, headers };
+      if (apiKey) updates.apiKey = apiKey;
+      
+      const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(currentProviderName)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+      });
+      
+      if (r.ok) {
+        toast('更新成功', 'success');
+        closeProviderModal();
+        loadProviders();
+        loadModels(); // Refresh models list
+      } else {
+        $('providerError').textContent = r.data?.error || '更新失败';
+        $('providerError').style.display = 'block';
+      }
+    } else {
+      // Create new
+      const r = await rpc('/v0/management/openai-compat/providers', {
+        method: 'POST',
+        body: JSON.stringify({ name, baseUrl, apiKey, prefix: prefix || undefined, headers }),
+      });
+      
+      if (r.ok) {
+        toast('创建成功', 'success');
+        closeProviderModal();
+        loadProviders();
+        loadModels(); // Refresh models list
+      } else {
+        $('providerError').textContent = r.data?.error || '创建失败';
+        $('providerError').style.display = 'block';
+      }
+    }
+  } catch (e) {
+    $('providerError').textContent = '请求失败: ' + e.message;
+    $('providerError').style.display = 'block';
+  } finally {
+    $('providerSubmitBtn').disabled = false;
+    $('providerSubmitBtn').textContent = currentProviderName ? '更新' : '保存';
+  }
+}
+
+async function deleteProvider(name) {
+  if (!confirm(`确定删除 Provider "${name}"？\n\n此操作将同时删除该 Provider 下的所有模型配置。`)) {
+    return;
+  }
+  
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+    
+    if (r.ok) {
+      toast('删除成功', 'success');
+      loadProviders();
+      loadModels(); // Refresh models list
+    } else {
+      toast('删除失败: ' + (r.data?.error || ''), 'error');
+    }
+  } catch (e) {
+    toast('删除失败: ' + e.message, 'error');
+  }
+}
+
+// Provider Models Management
+async function manageProviderModels(name) {
+  currentProviderName = name;
+  $('providerModelsTitle').textContent = `${name} - 模型管理`;
+  $('providerModelsSubtitle').textContent = '管理该 Provider 支持的模型';
+  $('providerModelsModal').style.display = 'flex';
+  await loadProviderModels(name);
+}
+
+function closeProviderModelsModal() {
+  $('providerModelsModal').style.display = 'none';
+  currentProviderName = null;
+  currentProviderModels = [];
+}
+
+async function loadProviderModels(name) {
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(name)}`);
+    if (!r.ok) {
+      $('providerModelsList').innerHTML = `<p style="color:var(--text-muted);text-align:center;padding:20px;">加载失败</p>`;
+      return;
+    }
+    
+    currentProviderModels = r.data?.models || [];
+    renderProviderModels(currentProviderModels);
+  } catch (e) {
+    $('providerModelsList').innerHTML = `<p style="color:var(--text-muted);text-align:center;padding:20px;">加载失败: ${e.message}</p>`;
+  }
+}
+
+function renderProviderModels(models) {
+  const container = $('providerModelsList');
+  
+  if (!models || models.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state" style="padding:40px;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>
+        </svg>
+        <p>暂无模型</p>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:8px;">点击上方按钮添加或从上游同步</p>
+      </div>`;
+    return;
+  }
+
+  let html = '<div style="display:grid;gap:8px;max-height:400px;overflow-y:auto;">';
+  
+  models.forEach(m => {
+    const statusClass = m.enabled ? 'success' : 'error';
+    const statusText = m.enabled ? '启用' : '禁用';
+    
+    html += `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:rgba(255,255,255,0.02);border-radius:var(--radius-md);border:1px solid var(--border-subtle);">
+        <div>
+          <div style="font-weight:500;font-size:14px;">${esc(m.modelId)}</div>
+          ${m.alias ? `<div style="font-size:12px;color:var(--text-muted);">别名: ${esc(m.alias)}</div>` : ''}
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="status-badge ${statusClass}" style="font-size:11px;padding:2px 8px;">${statusText}</span>
+          <button class="btn btn-icon btn-sm" onclick="toggleModelEnabled('${encodeURIComponent(m.modelId)}', ${!m.enabled})" title="${m.enabled ? '禁用' : '启用'}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+              ${m.enabled 
+                ? '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><path d="M12 2v10"/>' 
+                : '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>'}
+            </svg>
+          </button>
+          <button class="btn btn-icon btn-sm" onclick="deleteProviderModel('${encodeURIComponent(m.modelId)}')" title="删除" style="color:var(--accent-error);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+              <path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    `;
+  });
+  
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+async function toggleModelEnabled(modelId, enabled) {
+  if (!currentProviderName) return;
+  
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(currentProviderName)}/models/${modelId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    });
+    
+    if (r.ok) {
+      await loadProviderModels(currentProviderName);
+      loadModels(); // Refresh main models list
+    } else {
+      toast('操作失败: ' + (r.data?.error || ''), 'error');
+    }
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'error');
+  }
+}
+
+async function deleteProviderModel(modelId) {
+  if (!currentProviderName) return;
+  if (!confirm('确定删除此模型？')) return;
+  
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(currentProviderName)}/models/${modelId}`, {
+      method: 'DELETE',
+    });
+    
+    if (r.ok) {
+      toast('删除成功', 'success');
+      await loadProviderModels(currentProviderName);
+      loadModels(); // Refresh main models list
+    } else {
+      toast('删除失败: ' + (r.data?.error || ''), 'error');
+    }
+  } catch (e) {
+    toast('删除失败: ' + e.message, 'error');
+  }
+}
+
+async function syncProviderModels(e) {
+  if (!currentProviderName) return;
+  
+  const btn = e.target.closest('button');
+  const originalText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:4px;"></span>同步中...';
+  
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(currentProviderName)}/sync-models`, {
+      method: 'POST',
+    });
+    
+    if (r.ok) {
+      toast(`成功同步 ${r.data?.synced || 0} 个模型`, 'success');
+      await loadProviderModels(currentProviderName);
+      loadModels(); // Refresh main models list
+    } else {
+      toast('同步失败: ' + (r.data?.error || ''), 'error');
+    }
+  } catch (e) {
+    toast('同步失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalText;
+  }
+}
+
+// Add Model Modal
+function showAddModelModal() {
+  $('newModelId').value = '';
+  $('newModelAlias').value = '';
+  $('addModelError').style.display = 'none';
+  $('addModelModal').style.display = 'flex';
+}
+
+function closeAddModelModal() {
+  $('addModelModal').style.display = 'none';
+}
+
+async function submitAddModel() {
+  if (!currentProviderName) return;
+  
+  const modelId = $('newModelId').value.trim();
+  const alias = $('newModelAlias').value.trim();
+  
+  if (!modelId) {
+    $('addModelError').textContent = '请输入模型 ID';
+    $('addModelError').style.display = 'block';
+    return;
+  }
+  
+  $('addModelError').style.display = 'none';
+  
+  try {
+    const r = await rpc(`/v0/management/openai-compat/providers/${encodeURIComponent(currentProviderName)}/models`, {
+      method: 'POST',
+      body: JSON.stringify({ modelId, alias: alias || undefined }),
+    });
+    
+    if (r.ok) {
+      toast('添加成功', 'success');
+      closeAddModelModal();
+      await loadProviderModels(currentProviderName);
+      loadModels(); // Refresh main models list
+    } else {
+      $('addModelError').textContent = r.data?.error || '添加失败';
+      $('addModelError').style.display = 'block';
+    }
+  } catch (e) {
+    $('addModelError').textContent = '请求失败: ' + e.message;
+    $('addModelError').style.display = 'block';
+  }
+}

@@ -1,4 +1,5 @@
 import { getConfig } from '../config.js';
+import { getEnabledProviders, getAllEnabledModels } from '../storage/openai-compat.js';
 
 interface OAuthModelAlias {
   name: string;
@@ -6,7 +7,15 @@ interface OAuthModelAlias {
   fork?: boolean;
 }
 
-const KNOWN_PROVIDERS = ['gemini', 'codex', 'iflow'];
+const BUILTIN_PROVIDERS = ['gemini', 'codex', 'iflow'];
+
+/**
+ * Get all known providers including OpenAI-compatible ones.
+ */
+function getAllKnownProviders(): string[] {
+  const openAICompatNames = getEnabledProviders().map(p => p.name);
+  return [...BUILTIN_PROVIDERS, ...openAICompatNames];
+}
 
 /**
  * Parse a `provider/model` prefixed model input.
@@ -18,7 +27,7 @@ export function parseModelWithPrefix(input: string): { provider: string; model: 
   const provider = input.substring(0, slashIndex);
   const model = input.substring(slashIndex + 1);
   if (!provider || !model) return null;
-  if (!KNOWN_PROVIDERS.includes(provider)) return null;
+  if (!getAllKnownProviders().includes(provider)) return null;
   return { provider, model };
 }
 
@@ -34,6 +43,20 @@ export function matchWildcard(pattern: string, name: string): boolean {
 }
 
 /**
+ * Get OpenAI-compatible provider aliases from database.
+ */
+function getOpenAICompatAliases(providerName: string): Record<string, string> {
+  const models = getAllEnabledModels().filter(m => m.providerName === providerName);
+  const aliases: Record<string, string> = {};
+  for (const m of models) {
+    if (m.alias) {
+      aliases[m.alias] = m.modelId;
+    }
+  }
+  return aliases;
+}
+
+/**
  * Resolve a model alias to its real name.
  * If `provider` is specified, only checks that provider's aliases.
  * Otherwise checks all provider alias maps and OAuth model aliases.
@@ -42,7 +65,11 @@ export function resolveModelAlias(model: string, provider?: string): string {
   const config = getConfig();
 
   if (provider) {
-    // Only look in the specified provider's aliases
+    // Check if it's an OpenAI-compatible provider
+    const openAICompatAliases = getOpenAICompatAliases(provider);
+    if (openAICompatAliases[model]) return openAICompatAliases[model];
+
+    // Check built-in providers
     const aliasMap: Record<string, string> | undefined =
       provider === 'gemini' ? config.gemini.modelAliases
       : provider === 'codex' ? config.codex.modelAliases
@@ -62,6 +89,12 @@ export function resolveModelAlias(model: string, provider?: string): string {
   }
 
   // No provider specified — check all alias maps
+  // Check OpenAI-compatible providers first
+  const allOpenAIModels = getAllEnabledModels();
+  for (const m of allOpenAIModels) {
+    if (m.alias === model) return m.modelId;
+  }
+
   if (config.gemini.modelAliases[model]) {
     return config.gemini.modelAliases[model];
   }
@@ -103,9 +136,9 @@ function isModelSupported(model: string, supportedModels: string[]): boolean {
 
 /**
  * Determine which provider handles a given model.
- * Returns the provider name: 'gemini', 'codex', 'iflow', or null.
+ * Returns the provider name: 'gemini', 'codex', 'iflow', 'openrouter', etc., or null.
  * Supports `provider/model` prefix notation for direct routing.
- * Without prefix, priority: Codex → iFlow → Gemini.
+ * Without prefix, priority: OpenAI-compat → Codex → iFlow → Gemini.
  */
 export function getProviderForModel(model: string): string | null {
   // Try parsing prefix first
@@ -117,6 +150,14 @@ export function getProviderForModel(model: string): string | null {
   const config = getConfig();
   const resolved = resolveModelAlias(model);
   const oauthExcluded = config.oauthExcludedModels || {};
+
+  // Check OpenAI-compatible providers first
+  const openAIModels = getAllEnabledModels();
+  for (const m of openAIModels) {
+    if (m.modelId === resolved || m.alias === resolved) {
+      return m.providerName;
+    }
+  }
 
   // Check Codex (if enabled)
   if (config.codex.enabled) {
@@ -193,6 +234,64 @@ export function listAllModels(options?: { includeExcluded?: boolean }): Array<{ 
     }
     for (const alias of Object.keys(config.iflow.modelAliases)) {
       models.push({ id: `iflow/${alias}`, provider: 'iflow', owned_by: 'iflow' });
+    }
+  }
+
+  // OpenAI-compatible providers models
+  const openAIModels = getAllEnabledModels();
+  for (const m of openAIModels) {
+    const alias = m.alias || m.modelId;
+    models.push({ 
+      id: `${m.providerName}/${alias}`, 
+      provider: m.providerName, 
+      owned_by: m.providerName 
+    });
+  }
+
+  return models;
+}
+
+/**
+ * Get model information for a specific provider.
+ */
+export function getModelsForProvider(providerName: string): Array<{ id: string; name: string; alias?: string }> {
+  const config = getConfig();
+  const models: Array<{ id: string; name: string; alias?: string }> = [];
+
+  // Check if it's an OpenAI-compatible provider
+  const openAIModels = getAllEnabledModels().filter(m => m.providerName === providerName);
+  if (openAIModels.length > 0) {
+    for (const m of openAIModels) {
+      models.push({
+        id: `${providerName}/${m.alias || m.modelId}`,
+        name: m.modelId,
+        alias: m.alias,
+      });
+    }
+    return models;
+  }
+
+  // Built-in providers
+  if (providerName === 'gemini') {
+    for (const m of config.gemini.supportedModels) {
+      models.push({ id: `gemini/${m}`, name: m });
+    }
+    for (const [alias, name] of Object.entries(config.gemini.modelAliases)) {
+      models.push({ id: `gemini/${alias}`, name, alias });
+    }
+  } else if (providerName === 'codex' && config.codex.enabled) {
+    for (const m of config.codex.supportedModels) {
+      models.push({ id: `codex/${m}`, name: m });
+    }
+    for (const [alias, name] of Object.entries(config.codex.modelAliases)) {
+      models.push({ id: `codex/${alias}`, name, alias });
+    }
+  } else if (providerName === 'iflow' && config.iflow.enabled) {
+    for (const m of config.iflow.supportedModels) {
+      models.push({ id: `iflow/${m}`, name: m });
+    }
+    for (const [alias, name] of Object.entries(config.iflow.modelAliases)) {
+      models.push({ id: `iflow/${alias}`, name, alias });
     }
   }
 

@@ -117,3 +117,6 @@ management:
 logging:
   level: info
 proxy: ""
+
+# Note: OpenAI-compatible providers can be added dynamically via the admin panel
+# or through the management API at /v0/management/openai-compat/providers

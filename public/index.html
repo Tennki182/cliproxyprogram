@@ -79,6 +79,12 @@
       </svg>
       <span>模型</span>
     </div>
+    <div class="nav-item" data-page="providers" onclick="go('providers')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>
+      </svg>
+      <span>Provider</span>
+    </div>
     <div class="nav-item" data-page="manage" onclick="go('manage')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -383,6 +389,7 @@
     <!-- Models Page -->
     <div id="page-models" class="page">
       <div class="protocol-tabs" id="modelFilter" style="align-items:center;">
+        <!-- Filter tabs will be dynamically rendered by renderModelFilters() -->
         <div class="protocol-tab active" data-pf="all" onclick="filterModels('all')">全部</div>
         <div class="protocol-tab" data-pf="gemini" onclick="filterModels('gemini')">Gemini</div>
         <div class="protocol-tab" data-pf="codex" onclick="filterModels('codex')">Codex</div>
@@ -393,6 +400,31 @@
         </label>
       </div>
       <div class="model-list" id="modelList"></div>
+    </div>
+
+    <!-- Providers Page -->
+    <div id="page-providers" class="page">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>
+              </svg>
+            </div>
+            OpenAI 兼容 Provider
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="showAddProviderModal()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px">
+                <path d="M12 5v14"/><path d="M5 12h14"/>
+              </svg>
+              添加 Provider
+            </button>
+        </div>
+        <div id="providerList">
+          <p style="color: var(--text-muted); text-align: center; padding: 40px;">加载中...</p>
+        </div>
+      </div>
     </div>
 
     <!-- Manage Page -->
@@ -663,6 +695,104 @@
 </div>
 
 <div class="toast-container" id="toastBox"></div>
+
+<!-- Add/Edit Provider Modal -->
+<div id="providerModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);align-items:center;justify-content:center;">
+  <div style="max-width:520px;width:90%;background:var(--bg-card);border:1px solid var(--glass-border);border-radius:var(--radius-xl);padding:32px;position:relative;max-height:90vh;overflow-y:auto;">
+    <button onclick="closeProviderModal()" style="position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:20px;line-height:1;">&times;</button>
+    <h3 style="margin-bottom:8px;font-size:18px;" id="providerModalTitle">添加 Provider</h3>
+    <p style="color:var(--text-muted);font-size:13px;margin-bottom:20px;">配置 OpenAI 兼容的 API 提供商</p>
+
+    <div id="providerError" style="display:none;margin-bottom:16px;padding:12px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:var(--radius-md);color:var(--accent-error);font-size:13px;"></div>
+
+    <div class="form-group">
+      <label class="form-label">名称 <span style="color:var(--accent-error)">*</span></label>
+      <input type="text" id="providerName" class="form-input" placeholder="例如：openrouter">
+      <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">只能包含字母、数字、下划线和横线</p>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Base URL <span style="color:var(--accent-error)">*</span></label>
+      <input type="text" id="providerBaseUrl" class="form-input" placeholder="https://api.example.com/v1">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">API Key <span style="color:var(--accent-error)">*</span></label>
+      <input type="password" id="providerApiKey" class="form-input" placeholder="sk-...">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">前缀 (可选)</label>
+      <input type="text" id="providerPrefix" class="form-input" placeholder="例如：or">
+      <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">用于路由前缀，如 "or/gpt-4"</p>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">自定义 Headers (可选)</label>
+      <textarea id="providerHeaders" class="form-textarea" rows="3" placeholder='{"HTTP-Referer": "https://your-site.com"}'></textarea>
+      <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">JSON 格式</p>
+    </div>
+
+    <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:24px;">
+      <button class="btn btn-secondary" onclick="closeProviderModal()">取消</button>
+      <button class="btn btn-primary" id="providerSubmitBtn" onclick="submitProvider()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Provider Models Modal -->
+<div id="providerModelsModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);align-items:center;justify-content:center;">
+  <div style="max-width:640px;width:90%;background:var(--bg-card);border:1px solid var(--glass-border);border-radius:var(--radius-xl);padding:32px;position:relative;max-height:90vh;overflow-y:auto;">
+    <button onclick="closeProviderModelsModal()" style="position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:20px;line-height:1;">&times;</button>
+    <h3 style="margin-bottom:8px;font-size:18px;" id="providerModelsTitle">模型管理</h3>
+    <p style="color:var(--text-muted);font-size:13px;margin-bottom:20px;" id="providerModelsSubtitle"></p>
+
+    <div style="display:flex;gap:12px;margin-bottom:20px;">
+      <button class="btn btn-primary btn-sm" onclick="syncProviderModels(event)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:4px;">
+          <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M21 21v-5h-5"/>
+        </svg>
+        从上游同步
+      </button>
+      <button class="btn btn-secondary btn-sm" onclick="showAddModelModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:4px;">
+          <path d="M12 5v14"/><path d="M5 12h14"/>
+        </svg>
+        手动添加
+      </button>
+    </div>
+
+    <div id="providerModelsList">
+      <p style="color: var(--text-muted); text-align: center; padding: 40px;">暂无模型</p>
+    </div>
+  </div>
+</div>
+
+<!-- Add Model Modal -->
+<div id="addModelModal" style="display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);align-items:center;justify-content:center;">
+  <div style="max-width:400px;width:90%;background:var(--bg-card);border:1px solid var(--glass-border);border-radius:var(--radius-xl);padding:24px;position:relative;">
+    <button onclick="closeAddModelModal()" style="position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:20px;line-height:1;">&times;</button>
+    <h3 style="margin-bottom:16px;font-size:16px;">添加模型</h3>
+    
+    <div id="addModelError" style="display:none;margin-bottom:12px;padding:10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:var(--radius-md);color:var(--accent-error);font-size:12px;"></div>
+
+    <div class="form-group">
+      <label class="form-label">模型 ID <span style="color:var(--accent-error)">*</span></label>
+      <input type="text" id="newModelId" class="form-input" placeholder="例如：gpt-4">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">别名 (可选)</label>
+      <input type="text" id="newModelAlias" class="form-input" placeholder="例如：gpt4">
+      <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">客户端使用的简短名称</p>
+    </div>
+
+    <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:20px;">
+      <button class="btn btn-secondary btn-sm" onclick="closeAddModelModal()">取消</button>
+      <button class="btn btn-primary btn-sm" onclick="submitAddModel()">添加</button>
+    </div>
+  </div>
+</div>
 
 <!-- Remote Auth Modal -->
 <div id="remoteAuthModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);align-items:center;justify-content:center;">

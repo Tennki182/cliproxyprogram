@@ -2,6 +2,7 @@ import { getConfig } from '../config.js';
 import { logWarn } from './log-stream.js';
 
 const MAX_QUEUE_SIZE = 100;
+const MAX_RETRIES = 10; // 增加最大重试次数
 
 interface QueueItem<T> {
   execute: () => Promise<T>;
@@ -22,9 +23,9 @@ function getConcurrency(): number {
   }
 }
 
-function is429(error: any): boolean {
-  const msg = String(error?.message || '');
-  return msg.includes('(429)') || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+// 所有错误都允许重试
+function isRetryable(_error: any): boolean {
+  return true;
 }
 
 async function processQueue(): Promise<void> {
@@ -41,13 +42,18 @@ async function processQueue(): Promise<void> {
       const result = await item.execute();
       item.resolve(result);
     } catch (error: any) {
-      if (is429(error) && item.retries < maxRetries) {
+      // 所有错误都重试，直到达到最大次数
+      if (isRetryable(error) && item.retries < Math.min(maxRetries, MAX_RETRIES)) {
         item.retries++;
+        // 更短的重试间隔：基础 200ms，最大 2s，指数退避
+        const baseDelay = 200;
+        const maxDelay = 2000;
         const delay = Math.min(
-          config.retry.baseIntervalMs * Math.pow(config.retry.backoffMultiplier, item.retries - 1),
-          config.retry.maxIntervalMs
+          baseDelay * Math.pow(1.5, item.retries - 1),
+          maxDelay
         );
-        logWarn(`429 限流，第 ${item.retries} 次重试，${delay}ms 后重试`);
+        const errorMsg = error?.message || '未知错误';
+        logWarn(`请求失败，第 ${item.retries} 次重试，${Math.round(delay)}ms 后重试，错误: ${errorMsg.substring(0, 100)}`);
         // Schedule re-queue after delay
         setTimeout(() => {
           if (queue.length >= MAX_QUEUE_SIZE) {
@@ -72,8 +78,9 @@ async function processQueue(): Promise<void> {
 /**
  * Enqueue a request for execution.
  * - Memory queue with max 100 pending requests.
- * - On 429: re-queues with exponential backoff delay.
+ * - On any error: re-queues with exponential backoff delay.
  * - Works with rotation: retry calls acquireCredential() which picks a fresh account.
+ * - Retries up to 10 times with short delays (200ms - 2s).
  */
 export function enqueue<T>(execute: () => Promise<T>): Promise<T> {
   if (queue.length >= MAX_QUEUE_SIZE) {

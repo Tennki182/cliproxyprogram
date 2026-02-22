@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ProxyCLI - Docker Compose Override (Development)
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file overrides settings for development environment
+# Usage: docker compose -f docker-compose.yml -f docker-compose.override.yml up
+
+services:
+  proxycli:
+    build:
+      target: development
+    
+    environment:
+      - NODE_ENV=development
+      - LOG_LEVEL=debug
+    
+    # Mount source code for hot reload
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+      - ./src:/app/src:ro
+      - ./public:/app/public:ro
+    
+    # Remove read-only mode for development
+    read_only: false
+    
+    # No resource limits in development
+    deploy:
+      resources:
+        limits: {}
+    
+    # Development labels
+    labels:
+      - "com.proxycli.environment=development"

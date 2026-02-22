@@ -9,7 +9,7 @@ import {
 import { refreshAccessToken, refreshCodexToken, refreshIFlowToken } from './auth.js';
 import { getConfig } from '../config.js';
 
-const MAX_ATTEMPTS = 10;
+const MAX_ATTEMPTS = 20; // 增加凭证轮换尝试次数
 
 /**
  * Acquire the best available credential using configured rotation strategy.
@@ -63,7 +63,8 @@ export async function acquireCredential(opts?: {
           } else if (provider === 'iflow') {
             refreshed = await refreshIFlowToken(cred.refresh_token, cred.account_id);
           } else {
-            refreshed = await refreshAccessToken(cred.refresh_token);
+            // Pass account_id and project_id to preserve them during refresh
+            refreshed = await refreshAccessToken(cred.refresh_token, cred.account_id, cred.project_id);
           }
           markCredentialUsed(refreshed.account_id, refreshed.provider);
           return refreshed;

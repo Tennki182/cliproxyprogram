@@ -952,6 +952,7 @@
     .model-badge.gemini { background: rgba(66,133,244,0.1); color: #60a5fa; }
     .model-badge.codex { background: rgba(16,185,129,0.1); color: #34d399; }
     .model-badge.iflow { background: rgba(249,115,22,0.1); color: #fb923c; }
+    .model-badge.openai-compat { background: rgba(139,92,246,0.1); color: #a78bfa; }
 
     /* ========== Toast ========== */
     .toast-container {

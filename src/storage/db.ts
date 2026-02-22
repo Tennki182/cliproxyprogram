@@ -147,6 +147,35 @@ function initializeTables(): void {
     )
   `);
 
+  // OpenAI-compatible providers table
+  database.run(`
+    CREATE TABLE IF NOT EXISTS openai_compat_providers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      base_url TEXT NOT NULL,
+      api_key TEXT NOT NULL,
+      prefix TEXT,
+      headers TEXT DEFAULT '{}',
+      enabled INTEGER DEFAULT 1,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+    )
+  `);
+
+  // OpenAI-compatible provider models table
+  database.run(`
+    CREATE TABLE IF NOT EXISTS openai_compat_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      provider_name TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      alias TEXT,
+      enabled INTEGER DEFAULT 1,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (provider_name) REFERENCES openai_compat_providers(name) ON DELETE CASCADE,
+      UNIQUE(provider_name, model_id)
+    )
+  `);
+
   saveDatabase();
 }
 

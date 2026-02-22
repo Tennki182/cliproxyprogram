@@ -194,7 +194,12 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     }
 
     try {
-      const newCredential = await refreshAccessToken(credential.refresh_token);
+      // Pass account_id and project_id to preserve them during refresh
+      const newCredential = await refreshAccessToken(
+        credential.refresh_token,
+        credential.account_id,
+        credential.project_id
+      );
       return {
         success: true,
         account_id: newCredential.account_id,

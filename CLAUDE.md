@@ -4,14 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run Commands
 
+### Local Development
 ```bash
 npm run build          # tsc — compile TypeScript to dist/
 npm run dev            # tsx watch src/index.ts — hot-reload dev server
 npm start              # node dist/index.js — run compiled output
 npx tsc --noEmit       # type-check without emitting
 npm test               # jest (no test files exist yet)
-docker compose up -d   # Docker deployment
 ```
+
+### Docker
+```bash
+# Quick start
+docker compose up -d
+
+# Build
+./docker-build.sh build              # Production build
+./docker-build.sh build --target development  # Dev build
+./docker-build.sh build -t v1.0.0   # Tagged build
+
+# Compose operations
+./docker-build.sh compose-up         # Start services
+./docker-build.sh compose-down       # Stop services
+./docker-build.sh clean              # Cleanup
+
+# Windows PowerShell
+.\docker-build.ps1 build
+.\docker-build.ps1 compose-up
+```
+
+See [DOCKER.md](DOCKER.md) for detailed Docker deployment guide.
 
 ## Architecture Overview
 
@@ -48,6 +70,7 @@ All providers implement the `Provider` interface (`src/services/provider.ts`) an
 | `POST /v1beta/models/*` | Gemini | `src/routes/gemini-api.ts` |
 | `GET /v1/models` | OpenAI | `src/routes/models.ts` |
 | `/v0/management/*` | Custom | `src/routes/management.ts` |
+| `/v0/management/openai-compat/*` | Provider CRUD | `src/routes/openai-compat-management.ts` |
 | `/auth/*` | OAuth flows | `src/routes/auth.ts`, `auth-codex.ts`, `auth-iflow.ts` |
 
 ### Provider Implementations
@@ -55,6 +78,7 @@ All providers implement the `Provider` interface (`src/services/provider.ts`) an
 - **GeminiProvider** (`src/services/providers/gemini-provider.ts`) — delegates to Backend (cloudcode or public). Converter in `src/services/converter.ts` handles OpenAI↔Gemini message/tool format translation
 - **CodexProvider** (`src/services/providers/codex-provider.ts`) — OAuth PKCE auth, calls Responses API at `chatgpt.com/backend-api/codex/responses`
 - **IFlowProvider** (`src/services/providers/iflow-provider.ts`) — HMAC-SHA256 signed requests to `apis.iflow.cn/v1/chat/completions`
+- **OpenAICompatProvider** (`src/services/providers/openai-compat-provider.ts`) — generic OpenAI-compatible provider for third-party APIs (OpenRouter, SiliconFlow, etc.). Supports dynamic configuration via database
 
 ### Config & Hot-Reload
 
@@ -62,7 +86,11 @@ Config is a Zod-validated `config.yaml` (`src/config.ts`). `fs.watch()` with 500
 
 ### Database
 
-SQLite via sql.js (in-memory, persisted to disk on every write). Migrations are inline `ALTER TABLE ADD COLUMN` wrapped in try/catch. Two tables: `credentials` (provider accounts with rotation metadata) and `sessions`.
+SQLite via sql.js (in-memory, persisted to disk on every write). Migrations are inline `ALTER TABLE ADD COLUMN` wrapped in try/catch. Tables:
+- `credentials` — provider accounts with rotation metadata
+- `sessions` — chat history
+- `openai_compat_providers` — dynamic OpenAI-compatible provider configurations
+- `openai_compat_models` — models for dynamic providers
 
 ## Conventions
 

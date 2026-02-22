@@ -13,6 +13,7 @@ import { remoteAuthRoutes } from './routes/auth-remote.js';
 import { geminiApiRoutes } from './routes/gemini-api.js';
 import { anthropicRoutes } from './routes/anthropic.js';
 import { managementRoutes } from './routes/management.js';
+import { openAICompatManagementRoutes } from './routes/openai-compat-management.js';
 import { initDatabase, closeDatabase } from './storage/db.js';
 import { registerAuthMiddleware } from './middleware/auth.js';
 import { startConfigWatcher, stopConfigWatcher } from './services/config-watcher.js';
@@ -68,6 +69,7 @@ export async function createServer(): Promise<FastifyInstance> {
   await fastify.register(geminiApiRoutes);
   await fastify.register(anthropicRoutes);
   await fastify.register(managementRoutes);
+  await fastify.register(openAICompatManagementRoutes);
 
   // Health check
   fastify.get('/health', async () => {

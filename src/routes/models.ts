@@ -93,7 +93,7 @@ export async function modelRoutes(fastify: FastifyInstance): Promise<void> {
       const owned_by = providerName === 'gemini' ? 'google'
         : providerName === 'codex' ? 'openai'
         : providerName === 'iflow' ? 'iflow'
-        : 'unknown';
+        : providerName;  // For OpenAI-compatible providers, use the provider name
 
       const model: OpenAIModel = {
         id: displayId,
