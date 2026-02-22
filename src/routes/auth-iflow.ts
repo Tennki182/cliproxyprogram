@@ -47,27 +47,105 @@ function getBaseUrl(request: import('fastify').FastifyRequest): string {
   return `${proto}://${host}`;
 }
 
+/**
+ * Generate an iFlow OAuth authorization URL with a localhost-based redirect URI.
+ * Stores state in stateStore for later validation.
+ */
+export function generateIFlowAuthUrl(redirectBase: string): { authUrl: string } {
+  cleanExpiredStates();
+  const redirectUri = `${redirectBase}/auth/iflow/callback`;
+  const iflowConfig = getIFlowOAuthConfig();
+  const state = randomBytes(16).toString('hex');
+  stateStore.set(state, { redirectUri, expiresAt: Date.now() + STATE_EXPIRY_MS });
+
+  const params = new URLSearchParams({
+    loginMethod: 'phone',
+    type: 'phone',
+    redirect: redirectUri,
+    state,
+    client_id: iflowConfig.clientId,
+  });
+
+  return { authUrl: `${iflowConfig.authEndpoint}?${params.toString()}` };
+}
+
+/**
+ * Exchange an iFlow OAuth code for tokens and save the credential.
+ * Validates state from stateStore. Returns { email } on success.
+ */
+export async function exchangeIFlowCode(code: string, state: string): Promise<{ email: string }> {
+  const stateData = stateStore.get(state);
+  if (!stateData) {
+    throw new Error('无效的 state，请重新登录');
+  }
+  if (Date.now() > stateData.expiresAt) {
+    stateStore.delete(state);
+    throw new Error('State 已过期，请重新登录');
+  }
+  const redirectUri = stateData.redirectUri;
+  stateStore.delete(state);
+
+  const iflowConfig = getIFlowOAuthConfig();
+  const basicAuth = Buffer.from(`${iflowConfig.clientId}:${iflowConfig.clientSecret}`).toString('base64');
+
+  const tokenResponse = await pfetch(iflowConfig.tokenEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${basicAuth}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: iflowConfig.clientId,
+      client_secret: iflowConfig.clientSecret,
+    }),
+  });
+
+  const tokens = await tokenResponse.json() as any;
+
+  if (!tokens.access_token) {
+    throw new Error(tokens.error_description || tokens.error || 'Token exchange failed');
+  }
+
+  // Fetch user info + API key
+  const userInfoResponse = await pfetch(
+    `${iflowConfig.userinfoEndpoint}?accessToken=${tokens.access_token}`,
+    { headers: { 'Accept': 'application/json' } }
+  );
+
+  const userInfo = await userInfoResponse.json() as any;
+
+  if (!userInfo.success || !userInfo.data?.apiKey) {
+    throw new Error('无法获取 iFlow API Key');
+  }
+
+  const apiKey = userInfo.data.apiKey;
+  const email = userInfo.data.email || userInfo.data.phone || `iflow_${Date.now()}`;
+
+  // Store the API key as access_token (iFlow uses API key for actual requests)
+  const credential = {
+    account_id: email,
+    access_token: apiKey,
+    refresh_token: tokens.refresh_token || undefined,
+    expires_at: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined,
+    scope: tokens.scope || '',
+    provider: 'iflow',
+  };
+
+  saveCredential(credential);
+  return { email };
+}
+
 export async function iflowAuthRoutes(fastify: FastifyInstance): Promise<void> {
   /**
    * GET /auth/iflow/login — Redirect to iFlow OAuth
    */
   fastify.get('/auth/iflow/login', async (request, reply) => {
-    cleanExpiredStates();
     const baseUrl = getBaseUrl(request);
-    const redirectUri = `${baseUrl}/auth/iflow/callback`;
-    const iflowConfig = getIFlowOAuthConfig();
-    const state = randomBytes(16).toString('hex');
-    stateStore.set(state, { redirectUri, expiresAt: Date.now() + STATE_EXPIRY_MS });
-
-    const params = new URLSearchParams({
-      loginMethod: 'phone',
-      type: 'phone',
-      redirect: redirectUri,
-      state,
-      client_id: iflowConfig.clientId,
-    });
-
-    return reply.redirect(`${iflowConfig.authEndpoint}?${params.toString()}`);
+    const { authUrl } = generateIFlowAuthUrl(baseUrl);
+    return reply.redirect(authUrl);
   });
 
   /**
@@ -93,70 +171,8 @@ export async function iflowAuthRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(400).type('text/html').send('缺少授权码或 state');
       }
 
-      const stateData = stateStore.get(state);
-      if (!stateData) {
-        return reply.status(400).type('text/html').send('无效的 state，请重新登录');
-      }
-      if (Date.now() > stateData.expiresAt) {
-        stateStore.delete(state);
-        return reply.status(400).type('text/html').send('State 已过期，请重新登录');
-      }
-      const redirectUri = stateData.redirectUri;
-      stateStore.delete(state);
-
       try {
-        const iflowConfig = getIFlowOAuthConfig();
-
-        // Exchange code for tokens
-        const basicAuth = Buffer.from(`${iflowConfig.clientId}:${iflowConfig.clientSecret}`).toString('base64');
-
-        const tokenResponse = await pfetch(iflowConfig.tokenEndpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': `Basic ${basicAuth}`,
-          },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            redirect_uri: redirectUri,
-            client_id: iflowConfig.clientId,
-            client_secret: iflowConfig.clientSecret,
-          }),
-        });
-
-        const tokens = await tokenResponse.json() as any;
-
-        if (!tokens.access_token) {
-          throw new Error(tokens.error_description || tokens.error || 'Token exchange failed');
-        }
-
-        // Fetch user info + API key
-        const userInfoResponse = await pfetch(
-          `${iflowConfig.userinfoEndpoint}?accessToken=${tokens.access_token}`,
-          { headers: { 'Accept': 'application/json' } }
-        );
-
-        const userInfo = await userInfoResponse.json() as any;
-
-        if (!userInfo.success || !userInfo.data?.apiKey) {
-          throw new Error('无法获取 iFlow API Key');
-        }
-
-        const apiKey = userInfo.data.apiKey;
-        const email = userInfo.data.email || userInfo.data.phone || `iflow_${Date.now()}`;
-
-        // Store the API key as access_token (iFlow uses API key for actual requests)
-        const credential = {
-          account_id: email,
-          access_token: apiKey,
-          refresh_token: tokens.refresh_token || undefined,
-          expires_at: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined,
-          scope: tokens.scope || '',
-          provider: 'iflow',
-        };
-
-        saveCredential(credential);
+        const { email } = await exchangeIFlowCode(code, state);
 
         return reply.type('text/html').send(
           `<html><head>${PAGE_STYLE}</head><body><div class="box">
@@ -166,12 +182,12 @@ export async function iflowAuthRoutes(fastify: FastifyInstance): Promise<void> {
             ${CALLBACK_SCRIPT('/')}
           </div></body></html>`
         );
-      } catch (error: any) {
+      } catch (err: any) {
         return reply.type('text/html').send(
           `<html><head>${PAGE_STYLE}</head><body><div class="box">
             <span class="tag tag-err">iFlow 授权失败</span>
             <h2 class="err">认证出错</h2>
-            <p>${escapeHtml(error.message)}</p>
+            <p>${escapeHtml(err.message)}</p>
             <a href="/">返回管理面板</a>
           </div></body></html>`
         );

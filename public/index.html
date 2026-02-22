@@ -1682,6 +1682,45 @@
 
 <div class="toast-container" id="toastBox"></div>
 
+<!-- Remote Auth Modal -->
+<div id="remoteAuthModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);align-items:center;justify-content:center;">
+  <div style="max-width:520px;width:90%;background:var(--bg-card);border:1px solid var(--glass-border);border-radius:var(--radius-xl);padding:32px;position:relative;">
+    <button onclick="closeRemoteAuth()" style="position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:20px;line-height:1;">&times;</button>
+    <h3 style="margin-bottom:8px;font-size:18px;">远程 OAuth 认证</h3>
+    <p style="color:var(--text-muted);font-size:13px;margin-bottom:20px;">检测到远程访问，请按以下步骤完成授权：</p>
+
+    <div style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+        <span style="background:var(--accent-primary);color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;">1</span>
+        <span style="font-size:13px;">点击下方链接，在新标签页中完成 OAuth 登录：</span>
+      </div>
+      <a id="remoteAuthLink" href="#" target="_blank" rel="noopener" style="display:block;padding:12px 16px;background:rgba(139,92,246,0.1);border:1px solid var(--border-active);border-radius:var(--radius-md);font-size:13px;font-weight:500;color:var(--accent-primary);text-decoration:none;transition:background 0.2s;">加载中...</a>
+    </div>
+
+    <div style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+        <span style="background:var(--accent-primary);color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;">2</span>
+        <span style="font-size:13px;">登录后浏览器会跳转到 localhost（页面可能无法加载，这是正常的）</span>
+      </div>
+    </div>
+
+    <div style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+        <span style="background:var(--accent-primary);color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;">3</span>
+        <span style="font-size:13px;">复制浏览器地址栏中的完整 URL，粘贴到下方：</span>
+      </div>
+      <textarea id="remoteCallbackUrl" class="form-textarea" rows="3" placeholder="粘贴回调 URL（以 http://localhost 开头）..." style="font-family:'JetBrains Mono',monospace;font-size:12px;"></textarea>
+    </div>
+
+    <div style="display:flex;gap:12px;justify-content:flex-end;">
+      <button class="btn btn-secondary" onclick="closeRemoteAuth()">取消</button>
+      <button class="btn btn-primary" id="remoteSubmitBtn" onclick="submitRemoteCallback()">提交</button>
+    </div>
+    <p id="remoteAuthError" style="color:var(--accent-error);font-size:12px;margin-top:12px;display:none;"></p>
+    <p id="remoteAuthSuccess" style="color:var(--accent-success);font-size:12px;margin-top:12px;display:none;"></p>
+  </div>
+</div>
+
 <script>
 const API = location.origin;
 let PW = localStorage.getItem('proxy_login_secret') || '';
@@ -1864,11 +1903,102 @@ function updateProviderStatus(id, count) {
   }
 }
 
+function isRemoteAccess() {
+  const h = location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1') return false;
+  if (/^10\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^192\.168\./.test(h)) return false;
+  if (/^(fc|fd)[0-9a-f]{2}:/i.test(h) || /^fe80:/i.test(h)) return false;
+  return true;
+}
+
 function startAuth(provider) {
+  if (isRemoteAccess()) {
+    showRemoteAuthModal(provider);
+    return;
+  }
   const url = provider === 'codex' ? API + '/auth/codex/login'
     : provider === 'iflow' ? API + '/auth/iflow/login'
     : API + '/auth/login';
   window.open(url, '_blank');
+}
+
+let remoteAuthProvider = '';
+
+async function showRemoteAuthModal(provider) {
+  const backendProvider = provider === 'google' ? 'gemini' : provider;
+  remoteAuthProvider = backendProvider;
+
+  $('remoteAuthError').style.display = 'none';
+  $('remoteAuthSuccess').style.display = 'none';
+  $('remoteCallbackUrl').value = '';
+  $('remoteAuthLink').textContent = '加载中...';
+  $('remoteAuthLink').href = '#';
+  $('remoteSubmitBtn').disabled = false;
+  $('remoteSubmitBtn').textContent = '提交';
+  $('remoteAuthModal').style.display = 'flex';
+
+  try {
+    const r = await rpc('/auth/remote/init?provider=' + encodeURIComponent(backendProvider));
+    if (!r.ok) {
+      $('remoteAuthError').textContent = r.data?.error || '初始化失败';
+      $('remoteAuthError').style.display = 'block';
+      return;
+    }
+    $('remoteAuthLink').href = r.data.authUrl;
+    $('remoteAuthLink').textContent = '点击此处打开授权页面 →';
+  } catch (e) {
+    $('remoteAuthError').textContent = '请求失败: ' + e.message;
+    $('remoteAuthError').style.display = 'block';
+  }
+}
+
+async function submitRemoteCallback() {
+  const callbackUrl = $('remoteCallbackUrl').value.trim();
+  if (!callbackUrl) {
+    $('remoteAuthError').textContent = '请粘贴回调 URL';
+    $('remoteAuthError').style.display = 'block';
+    return;
+  }
+
+  if (!/^https?:\/\/localhost[:/]/.test(callbackUrl)) {
+    $('remoteAuthError').textContent = 'URL 应以 http://localhost 开头';
+    $('remoteAuthError').style.display = 'block';
+    return;
+  }
+
+  $('remoteAuthError').style.display = 'none';
+  $('remoteAuthSuccess').style.display = 'none';
+  $('remoteSubmitBtn').disabled = true;
+  $('remoteSubmitBtn').textContent = '提交中...';
+
+  try {
+    const r = await rpc('/auth/remote/exchange', {
+      method: 'POST',
+      body: JSON.stringify({ provider: remoteAuthProvider, callbackUrl }),
+    });
+    if (r.ok && r.data?.success) {
+      $('remoteAuthSuccess').textContent = '认证成功: ' + r.data.accountId;
+      $('remoteAuthSuccess').style.display = 'block';
+      toast('认证完成: ' + r.data.accountId, 'success');
+      loadCredentials();
+      checkAuth();
+      setTimeout(() => closeRemoteAuth(), 2000);
+    } else {
+      $('remoteAuthError').textContent = r.data?.error || '认证失败';
+      $('remoteAuthError').style.display = 'block';
+    }
+  } catch (e) {
+    $('remoteAuthError').textContent = '请求失败: ' + e.message;
+    $('remoteAuthError').style.display = 'block';
+  } finally {
+    $('remoteSubmitBtn').disabled = false;
+    $('remoteSubmitBtn').textContent = '提交';
+  }
+}
+
+function closeRemoteAuth() {
+  $('remoteAuthModal').style.display = 'none';
+  remoteAuthProvider = '';
 }
 
 // ========== Stats ==========

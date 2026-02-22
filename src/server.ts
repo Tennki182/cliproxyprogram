@@ -9,6 +9,7 @@ import { modelRoutes } from './routes/models.js';
 import { authRoutes } from './routes/auth.js';
 import { codexAuthRoutes } from './routes/auth-codex.js';
 import { iflowAuthRoutes } from './routes/auth-iflow.js';
+import { remoteAuthRoutes } from './routes/auth-remote.js';
 import { geminiApiRoutes } from './routes/gemini-api.js';
 import { anthropicRoutes } from './routes/anthropic.js';
 import { managementRoutes } from './routes/management.js';
@@ -63,6 +64,7 @@ export async function createServer(): Promise<FastifyInstance> {
   await fastify.register(authRoutes);
   await fastify.register(codexAuthRoutes);
   await fastify.register(iflowAuthRoutes);
+  await fastify.register(remoteAuthRoutes);
   await fastify.register(geminiApiRoutes);
   await fastify.register(anthropicRoutes);
   await fastify.register(managementRoutes);

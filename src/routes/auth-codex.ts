@@ -57,10 +57,23 @@ function cleanExpiredStates(): void {
 }
 
 /**
+ * Generate PKCE verifier, challenge, and state for Codex OAuth.
+ * Stores the verifier in pkceStore keyed by state.
+ */
+export function generatePkce(): { challenge: string; state: string } {
+  cleanExpiredStates();
+  const verifier = base64UrlEncode(randomBytes(32));
+  const challenge = base64UrlEncode(createHash('sha256').update(verifier).digest());
+  const state = base64UrlEncode(randomBytes(16));
+  pkceStore.set(state, { verifier, expiresAt: Date.now() + PKCE_EXPIRY_MS });
+  return { challenge, state };
+}
+
+/**
  * Shared token exchange logic: validate PKCE state, exchange code for tokens, save credential.
  * Returns { accountId } on success.
  */
-async function exchangeCodexCode(code: string, state: string): Promise<{ accountId: string }> {
+export async function exchangeCodexCode(code: string, state: string): Promise<{ accountId: string }> {
   const pkce = pkceStore.get(state);
   if (!pkce) {
     throw new Error('无效的 state，请重新登录');
@@ -197,19 +210,13 @@ export async function codexAuthRoutes(fastify: FastifyInstance): Promise<void> {
    * GET /auth/codex/login — Redirect to OpenAI OAuth with PKCE
    */
   fastify.get('/auth/codex/login', async (request, reply) => {
-    cleanExpiredStates();
-
     // Remember the admin panel origin for redirect-back links
     const proto = (request.headers['x-forwarded-proto'] as string) || request.protocol || 'http';
     const host = (request.headers['x-forwarded-host'] as string) || request.headers.host || 'localhost:8488';
     const adminOrigin = `${proto}://${host}`;
 
     // Generate PKCE
-    const verifier = base64UrlEncode(randomBytes(32));
-    const challenge = base64UrlEncode(createHash('sha256').update(verifier).digest());
-    const state = base64UrlEncode(randomBytes(16));
-
-    pkceStore.set(state, { verifier, expiresAt: Date.now() + PKCE_EXPIRY_MS });
+    const { challenge, state } = generatePkce();
 
     // Start temporary callback server (OpenAI requires localhost:1455)
     await startCallbackServer(adminOrigin);
