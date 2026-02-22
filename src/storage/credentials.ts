@@ -191,6 +191,66 @@ export function getNextCredentialFillFirst(requireProject: boolean = true, provi
 }
 
 /**
+ * Get the credential with the shortest rate-limit wait time.
+ * Used when all credentials are rate-limited to find the one that will be available soonest.
+ */
+export function getLeastRateLimitedCredential(requireProject: boolean = true, provider?: string): Credential | null {
+  const db = getDatabase();
+
+  const clauses: string[] = ['rate_limited_until > 0'];
+  const params: unknown[] = [];
+
+  if (requireProject) {
+    clauses.push(`project_id IS NOT NULL AND project_id != ''`);
+  }
+  if (provider) {
+    clauses.push(`provider = ?`);
+    params.push(provider);
+  }
+
+  // Pick the one with shortest rate-limit time (will be available soonest)
+  const result = db.exec(
+    `SELECT * FROM credentials
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY rate_limited_until ASC
+     LIMIT 1`,
+    params as any[]
+  );
+
+  return rowToObject<Credential>(result);
+}
+
+/**
+ * Get any credential regardless of rate-limit status.
+ * Used as fallback when no non-rate-limited credentials are available.
+ */
+export function getAnyCredential(requireProject: boolean = true, provider?: string): Credential | null {
+  const db = getDatabase();
+
+  const clauses: string[] = ['1=1']; // Always true, no rate-limit filter
+  const params: unknown[] = [];
+
+  if (requireProject) {
+    clauses.push(`project_id IS NOT NULL AND project_id != ''`);
+  }
+  if (provider) {
+    clauses.push(`provider = ?`);
+    params.push(provider);
+  }
+
+  // Pick the least recently used credential (rotation)
+  const result = db.exec(
+    `SELECT * FROM credentials
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY last_used_at ASC
+     LIMIT 1`,
+    params as any[]
+  );
+
+  return rowToObject<Credential>(result);
+}
+
+/**
  * Mark a credential as just used (update last_used_at).
  */
 export function markCredentialUsed(accountId: string, provider?: string): void {

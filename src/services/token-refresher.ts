@@ -54,7 +54,8 @@ function shouldRefreshCredential(cred: Credential, now: number): boolean {
   }
 
   // Check if within refresh window
-  const remaining = cred.expires_at * 1000 - now;
+  // Note: expires_at is stored in milliseconds (Date.now() + expires_in * 1000)
+  const remaining = cred.expires_at - now;
   if (remaining > REFRESH_AHEAD_MS) {
     return false; // Not yet in refresh window
   }

@@ -2,6 +2,7 @@ import {
   Credential,
   getNextCredential,
   getNextCredentialFillFirst,
+  getAnyCredential,
   markCredentialUsed,
   markCredentialRateLimited,
 } from '../storage/credentials.js';
@@ -12,7 +13,8 @@ const MAX_ATTEMPTS = 10;
 
 /**
  * Acquire the best available credential using configured rotation strategy.
- * Automatically refreshes expired tokens and skips rate-limited accounts.
+ * Automatically refreshes expired tokens.
+ * Rate-limited credentials are used as fallback when no others available.
  */
 export async function acquireCredential(opts?: {
   requireProject?: boolean;
@@ -25,15 +27,28 @@ export async function acquireCredential(opts?: {
   const tried = new Set<string>();
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const cred = strategy === 'fill-first'
+    // First try: get non-rate-limited credential
+    let cred = strategy === 'fill-first'
       ? getNextCredentialFillFirst(requireProject, provider)
       : getNextCredential(requireProject, provider);
 
-    if (!cred) return null;
+    // Second try: if no non-rate-limited cred, use any including rate-limited ones
+    if (!cred) {
+      cred = getAnyCredential(requireProject, provider);
+    }
+
+    // No credentials at all
+    if (!cred) {
+      return null;
+    }
 
     // Avoid infinite loop on the same credential
     const credKey = `${cred.account_id}:${cred.provider || 'gemini'}`;
-    if (tried.has(credKey)) return null;
+    if (tried.has(credKey)) {
+      // Already tried this one, just use it anyway
+      markCredentialUsed(cred.account_id, cred.provider);
+      return cred;
+    }
     tried.add(credKey);
 
     const now = Date.now();
@@ -66,18 +81,21 @@ export async function acquireCredential(opts?: {
       }
     }
 
-    // Token is valid
+    // Token is valid (may be rate-limited but we'll use it anyway)
     markCredentialUsed(cred.account_id, cred.provider);
     return cred;
   }
 
+  // Fallback: return the first tried credential if all attempts failed
   return null;
 }
 
 /**
  * Report that a credential hit a 429 rate limit.
+ * Uses short duration (1s) since we still want to retry quickly.
  */
-export function reportRateLimit(accountId: string, retryAfterSeconds: number): void {
-  const until = Math.floor(Date.now() / 1000) + retryAfterSeconds;
+export function reportRateLimit(accountId: string, _retryAfterSeconds: number): void {
+  // Use short 1 second rate-limit to avoid hammering, but allow quick retry
+  const until = Math.floor(Date.now() / 1000) + 1;
   markCredentialRateLimited(accountId, until);
 }

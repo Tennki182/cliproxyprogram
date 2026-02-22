@@ -146,10 +146,10 @@ const ConfigSchema = z.object({
     strategy: z.enum(['round-robin', 'fill-first']).default('round-robin'),
   }).default({}),
   retry: z.object({
-    maxRetries: z.number().default(3),
-    backoffMultiplier: z.number().default(2),
-    maxIntervalMs: z.number().default(30000),
-    baseIntervalMs: z.number().default(5000),
+    maxRetries: z.number().default(5),
+    backoffMultiplier: z.number().default(1),
+    maxIntervalMs: z.number().default(1000),
+    baseIntervalMs: z.number().default(1000),
   }).default({}),
   management: z.object({
     enabled: z.boolean().default(true),
