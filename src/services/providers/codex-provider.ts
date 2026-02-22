@@ -65,7 +65,28 @@ export class CodexProvider implements Provider {
       input,
       instructions: systemMsg?.content ?? '',
       store: false,
+      parallel_tool_calls: true,
+      tool_choice: 'auto',
     };
+    
+    // Add tools if provided
+    if (request.tools && request.tools.length > 0) {
+      body.tools = request.tools
+        .filter((t: any) => t.type === 'function')
+        .map((t: any) => ({
+          type: 'function',
+          name: t.function.name,
+          description: t.function.description || '',
+          parameters: t.function.parameters || { type: 'object', properties: {} },
+          strict: false,
+        }));
+      if (body.tools.length === 0) {
+        delete body.tools;
+        delete body.tool_choice;
+      }
+    } else {
+      delete body.tool_choice;
+    }
 
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
       method: 'POST',
@@ -151,7 +172,28 @@ export class CodexProvider implements Provider {
       input,
       instructions: systemMsg?.content ?? '',
       store: false,
+      parallel_tool_calls: true,
+      tool_choice: 'auto',
     };
+    
+    // Add tools if provided
+    if (request.tools && request.tools.length > 0) {
+      body.tools = request.tools
+        .filter((t: any) => t.type === 'function')
+        .map((t: any) => ({
+          type: 'function',
+          name: t.function.name,
+          description: t.function.description || '',
+          parameters: t.function.parameters || { type: 'object', properties: {} },
+          strict: false,
+        }));
+      if (body.tools.length === 0) {
+        delete body.tools;
+        delete body.tool_choice;
+      }
+    } else {
+      delete body.tool_choice;
+    }
 
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
       method: 'POST',

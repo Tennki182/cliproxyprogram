@@ -40,9 +40,8 @@ export async function remoteAuthRoutes(fastify: FastifyInstance): Promise<void> 
       const port = getConfig().server.port;
 
       if (provider === 'gemini') {
-        const localhostBase = `http://localhost:${port}`;
-        const authUrl = getAuthorizationUrl(localhostBase);
-        return { authUrl, redirectUri: `${localhostBase}/auth/callback` };
+        const authUrl = getAuthorizationUrl('');
+        return { authUrl, redirectUri: 'http://localhost:8085/oauth2callback' };
       }
 
       if (provider === 'codex') {
@@ -112,8 +111,7 @@ export async function remoteAuthRoutes(fastify: FastifyInstance): Promise<void> 
         }
 
         if (provider === 'gemini') {
-          const localhostBase = `http://localhost:${getConfig().server.port}`;
-          const credential = await exchangeCodeForTokens(code, localhostBase);
+          const credential = await exchangeCodeForTokens(code, '');
           logInfo(`远程 Gemini 认证成功: ${credential.account_id}`);
           return { success: true, accountId: credential.account_id, projectId: credential.project_id };
         }

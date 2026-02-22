@@ -44,30 +44,16 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     </script>`;
 
   /**
-   * Detect if the request originates from localhost
-   */
-  function isLocalRequest(request: import('fastify').FastifyRequest): boolean {
-    const host = (request.headers['x-forwarded-host'] as string) || request.headers.host || '';
-    const hostname = host.split(':')[0];
-    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
-  }
-
-  /**
-   * GET /auth/login - Redirect to Google OAuth consent screen
-   * On VPS (non-localhost), show a manual auth page instead of direct redirect
+   * GET /auth/login - Show manual auth page for both local and remote access
+   * Google OAuth requires redirect_uri to match registered URL exactly:
+   * - Must use port 8085
+   * - Must use path /oauth2callback
+   * Since the main server may not listen on 8085, we use the manual auth flow
    */
   fastify.get('/auth/login', async (request, reply) => {
-    if (isLocalRequest(request)) {
-      // Local access: direct redirect to Google OAuth
-      const baseUrl = getBaseUrl(request);
-      const authUrl = getAuthorizationUrl(baseUrl);
-      return reply.redirect(authUrl);
-    }
-
-    // Remote/VPS access: use localhost-based redirect_uri and show manual auth page
-    const port = getConfig().server.port;
-    const localhostBase = `http://localhost:${port}`;
-    const authUrl = getAuthorizationUrl(localhostBase);
+    // Use localhost-based redirect_uri and show manual auth page
+    // This works for both local and remote access
+    const authUrl = getAuthorizationUrl('');
     const baseUrl = getBaseUrl(request);
 
     return reply.type('text/html').send(
@@ -77,7 +63,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
         <p>检测到您通过远程方式访问，请按以下步骤完成认证：</p>
         <div class="hint">
           <strong>步骤 1</strong>：<a href="${escapeHtml(authUrl)}" target="_blank" style="color:#7c5cf8">点击此处打开 Google 授权页面</a><br>
-          <strong>步骤 2</strong>：完成授权后，浏览器会跳转到 <code>http://localhost:...</code> 并显示错误（这是正常的）<br>
+          <strong>步骤 2</strong>：完成授权后，浏览器会跳转到 <code>http://localhost:8085/oauth2callback?code=...</code><br>
           <strong>步骤 3</strong>：复制浏览器地址栏中的完整 URL，粘贴到下方输入框
         </div>
         <form onsubmit="return submitCallback()" style="margin-top:16px;text-align:left;">

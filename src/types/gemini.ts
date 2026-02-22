@@ -46,7 +46,7 @@ export interface GeminiGenerationConfig {
 export interface GeminiFunctionDeclaration {
   name: string;
   description?: string;
-  parameters: {
+  parametersJsonSchema?: {
     type: string;
     properties: Record<string, unknown>;
     required?: string[];
@@ -54,7 +54,10 @@ export interface GeminiFunctionDeclaration {
 }
 
 export interface GeminiTool {
-  functionDeclarations: GeminiFunctionDeclaration[];
+  functionDeclarations?: GeminiFunctionDeclaration[];
+  googleSearch?: any;
+  codeExecution?: any;
+  urlContext?: any;
 }
 
 export interface GeminiToolConfig {

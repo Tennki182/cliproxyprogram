@@ -4,10 +4,12 @@ import { pfetch } from './http.js';
 
 /**
  * Generate OAuth authorization URL for browser-based login
+ * Uses fixed port 8085 and path /oauth2callback to match registered redirect_uri
  */
-export function getAuthorizationUrl(baseUrl: string): string {
+export function getAuthorizationUrl(_baseUrl?: string): string {
   const config = getGeminiOAuthConfig();
-  const redirectUri = `${baseUrl}/auth/callback`;
+  // Use fixed port 8085 and /oauth2callback path to match Google OAuth app registration
+  const redirectUri = 'http://localhost:8085/oauth2callback';
 
   const params = new URLSearchParams({
     client_id: config.clientId,
@@ -23,10 +25,12 @@ export function getAuthorizationUrl(baseUrl: string): string {
 
 /**
  * Exchange authorization code for access and refresh tokens
+ * Uses fixed port 8085 and path /oauth2callback to match registered redirect_uri
  */
-export async function exchangeCodeForTokens(code: string, baseUrl: string): Promise<Credential> {
+export async function exchangeCodeForTokens(code: string, _baseUrl: string): Promise<Credential> {
   const config = getGeminiOAuthConfig();
-  const redirectUri = `${baseUrl}/auth/callback`;
+  // Use fixed port 8085 and /oauth2callback path to match Google OAuth app registration
+  const redirectUri = 'http://localhost:8085/oauth2callback';
 
   const response = await pfetch('https://oauth2.googleapis.com/token', {
     method: 'POST',

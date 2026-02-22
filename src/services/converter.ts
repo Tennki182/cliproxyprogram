@@ -1,6 +1,5 @@
 import {
   OpenAIMessage,
-  OpenAITool,
   OpenAIToolChoice,
   OpenAIChatCompletionRequest,
 } from '../types/openai.js';
@@ -18,6 +17,26 @@ export interface ConvertOptions {
 }
 
 /**
+ * Build a map from tool_call_id to function name from assistant messages
+ */
+function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      const toolCalls = (msg as any).tool_calls;
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          if (tc.id && tc.function?.name) {
+            map.set(tc.id, tc.function.name);
+          }
+        }
+      }
+    }
+  }
+  return map;
+}
+
+/**
  * Convert OpenAI messages to Gemini contents format
  */
 export function convertMessagesToContents(
@@ -26,6 +45,9 @@ export function convertMessagesToContents(
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
   const includeThought = options?.includeThoughtSignature ?? true;
+  
+  // Build tool_call_id -> function name mapping for tool responses
+  const toolCallIdToName = buildToolCallIdToNameMap(messages);
 
   for (const msg of messages) {
     // Skip system messages - Gemini uses systemInstruction separately
@@ -70,12 +92,16 @@ export function convertMessagesToContents(
         parts,
       });
     } else if (msg.role === 'tool') {
+      // Map tool_call_id to function name
+      const toolCallId = (msg as any).tool_call_id;
+      const functionName = toolCallId ? (toolCallIdToName.get(toolCallId) || (msg as any).name) : (msg as any).name;
+      
       contents.push({
         role: 'user',
         parts: [
           {
             functionResponse: {
-              name: (msg as any).name || '',
+              name: functionName || '',
               response: { result: msg.content },
             },
           } as GeminiFunctionResponsePart,
@@ -135,14 +161,16 @@ export function convertToGeminiConfig(
 }
 
 /**
- * Convert OpenAI tools to Gemini function declarations
+ * Convert OpenAI tools to Gemini format.
+ * Supports function declarations and special tools (google_search, code_execution, url_context).
  */
 export function convertToolsToGemini(
-  tools?: OpenAITool[]
+  tools?: any[]
 ): GeminiTool[] | undefined {
   if (!tools || tools.length === 0) return undefined;
 
   const functionDeclarations: GeminiFunctionDeclaration[] = [];
+  const specialTools: any[] = [];
 
   for (const tool of tools) {
     if (tool.type === 'function') {
@@ -150,23 +178,52 @@ export function convertToolsToGemini(
         name: tool.function.name,
         description: tool.function.description || '',
         parametersJsonSchema: cleanSchemaForGemini(tool.function.parameters),
-      } as any);
+      });
+    } else if (tool.google_search) {
+      // Google Search tool
+      specialTools.push({ googleSearch: tool.google_search });
+    } else if (tool.code_execution) {
+      // Code Execution tool
+      specialTools.push({ codeExecution: tool.code_execution });
+    } else if (tool.url_context) {
+      // URL Context tool
+      specialTools.push({ urlContext: tool.url_context });
     }
   }
 
-  return [{ functionDeclarations }];
+  const result: GeminiTool[] = [];
+  
+  if (functionDeclarations.length > 0) {
+    result.push({ functionDeclarations });
+  }
+  
+  // Add special tools (each as separate tool object)
+  for (const special of specialTools) {
+    result.push(special);
+  }
+  
+  return result.length > 0 ? result : undefined;
 }
 
 /**
  * Clean JSON schema for Gemini compatibility
  */
-function cleanSchemaForGemini(schema: Record<string, unknown>): any {
+function cleanSchemaForGemini(schema: Record<string, unknown> | undefined): any {
+  // Default schema if none provided
+  if (!schema || Object.keys(schema).length === 0) {
+    return {
+      type: 'object',
+      properties: {},
+    };
+  }
+
   const cleaned = { ...schema };
 
-  // Remove $ref, $defs (Gemini doesn't support these)
+  // Remove fields not supported by Gemini
   delete cleaned.$ref;
   delete cleaned.$defs;
   delete cleaned.definitions;
+  delete cleaned.strict;
 
   // Process properties recursively
   if (cleaned.properties && typeof cleaned.properties === 'object') {

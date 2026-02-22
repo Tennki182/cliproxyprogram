@@ -237,7 +237,7 @@ async function submitRemoteCallback() {
     return;
   }
 
-  if (!/^https?:\/\/localhost[:/]/.test(callbackUrl)) {
+  if (!/^https?:\/\/localhost(:\d+)?\//.test(callbackUrl)) {
     $('remoteAuthError').textContent = 'URL 应以 http://localhost 开头';
     $('remoteAuthError').style.display = 'block';
     return;
