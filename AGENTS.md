@@ -360,6 +360,18 @@ docker build -t proxycli .
 docker run -p 8488:8488 -v ./config.yaml:/app/config.yaml:ro -v ./data:/app/data proxycli
 ```
 
+## OAuth 配置重要说明
+
+**【切勿在 config.yaml 中配置 codex 和 iflow 的 OAuth 凭证！**]
+
+代码中内置了 codex 和 iflow 的默认 OAuth 凭证：
+- **Codex**: `clientId: app_EMoamEEZ73f0CkXaXp7hrann`
+- **iFlow**: `clientId: 10009311001`, `clientSecret: 4Z3YjXycVsQvyGF1etiNlIBB4RsqSDtW`
+
+配置逻辑是 `cfg.oauth?.codex || defaultConfig`，如果配置了无效的占位符（如 `your-xxx-client-id`），会导致 OAuth 授权失败。
+
+**正确做法**：config.yaml 中只配置 `oauth.gemini`，不要添加 `oauth.codex` 或 `oauth.iflow` 节点。
+
 ## 认证流程
 
 ### Gemini (OAuth)

@@ -82,8 +82,11 @@ kimi:
   supportedModels: []
   modelAliases: {}
   excludedModels: []
-# Gemini CLI OAuth credentials (参考 https://github.com/Tennki182/CLIProxyAPI)
-# 如果要使用自己的 OAuth 应用，请替换以下 clientId 和 clientSecret
+# OAuth 配置说明:
+# - gemini: 需要配置 clientId 和 clientSecret（使用下方默认值或自己的 OAuth 应用）
+# - codex 和 iflow: 【重要】不要配置！代码内置了默认凭证，配置后会覆盖默认值导致授权失败
+#   如果配置了 codex/iflow 节点但值是占位符（如 "your-xxx"），OAuth 会失败！
+#   正确做法：直接删除 codex 和 iflow 节点，让代码使用内置默认值
 oauth:
   gemini:
     clientId: 681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com
@@ -92,18 +95,8 @@ oauth:
       - https://www.googleapis.com/auth/cloud-platform
       - https://www.googleapis.com/auth/userinfo.email
       - https://www.googleapis.com/auth/userinfo.profile
-  codex:
-    clientId: your-codex-client-id
-    authEndpoint: https://auth.openai.com/oauth/authorize
-    tokenEndpoint: https://auth.openai.com/oauth/token
-    apiBase: https://chatgpt.com/backend-api/codex
-  iflow:
-    clientId: "your-iflow-client-id"
-    clientSecret: your-iflow-client-secret
-    authEndpoint: https://iflow.cn/oauth
-    tokenEndpoint: https://iflow.cn/oauth/token
-    userinfoEndpoint: https://iflow.cn/api/oauth/getUserInfo
-    apiBase: https://apis.iflow.cn/v1
+  # codex 和 iflow 使用内置默认凭证，请勿配置！
+  # 如果需要自定义，请确保 clientId 等字段是有效值，不能是占位符
 routing:
   strategy: round-robin
 retry:
