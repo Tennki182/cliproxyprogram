@@ -291,15 +291,31 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
    */
   fastify.get('/auth/accounts', async (_request, _reply) => {
     const credentials = listCredentials();
+    const now = Math.floor(Date.now() / 1000);
     return {
-      accounts: credentials.map(c => ({
-        account_id: c.account_id,
-        project_id: c.project_id,
-        expires_at: c.expires_at,
-        has_refresh_token: !!c.refresh_token,
-        provider: c.provider || 'gemini',
-        proxy_url: c.proxy_url || null,
-      })),
+      accounts: credentials.map(c => {
+        // Calculate active model cooldowns
+        const activeCooldowns: Record<string, number> = {};
+        if (c.model_cooldowns) {
+          for (const [model, timestamp] of Object.entries(c.model_cooldowns)) {
+            if (timestamp > now) {
+              activeCooldowns[model] = timestamp;
+            }
+          }
+        }
+        return {
+          account_id: c.account_id,
+          project_id: c.project_id,
+          expires_at: c.expires_at,
+          has_refresh_token: !!c.refresh_token,
+          provider: c.provider || 'gemini',
+          proxy_url: c.proxy_url || null,
+          preview: c.preview !== false,
+          validation_required: c.validation_required || false,
+          validation_url: c.validation_url || null,
+          model_cooldowns: activeCooldowns,
+        };
+      }),
     };
   });
 

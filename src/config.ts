@@ -117,6 +117,7 @@ const ConfigSchema = z.object({
     apiKey: z.string().optional(),
     modelAliases: z.record(z.string(), z.string()).default({}),
     excludedModels: z.array(z.string()).default([]),
+    autoBanErrorCodes: z.array(z.number()).default([403]),
   }),
   codex: z.object({
     enabled: z.boolean().default(false),

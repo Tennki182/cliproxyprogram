@@ -5,23 +5,30 @@ import {
   getAnyCredential,
   markCredentialUsed,
   markCredentialRateLimited,
+  GetCredentialOptions,
 } from '../storage/credentials.js';
 import { refreshAccessToken, refreshCodexToken, refreshIFlowToken } from './auth.js';
 import { getConfig } from '../config.js';
 
 const MAX_ATTEMPTS = 20; // 增加凭证轮换尝试次数
 
+export interface AcquireCredentialOptions extends GetCredentialOptions {
+  modelName?: string;
+  requireValid?: boolean;
+}
+
 /**
  * Acquire the best available credential using configured rotation strategy.
  * Automatically refreshes expired tokens.
  * Rate-limited credentials are used as fallback when no others available.
+ * Supports model-based preview filtering and model cooldown checking.
  */
-export async function acquireCredential(opts?: {
-  requireProject?: boolean;
-  provider?: string;
-}): Promise<Credential | null> {
+export async function acquireCredential(opts?: AcquireCredentialOptions): Promise<Credential | null> {
   const requireProject = opts?.requireProject ?? true;
   const provider = opts?.provider;
+  const modelName = opts?.modelName;
+  const requireValid = opts?.requireValid ?? true;
+  
   const config = getConfig();
   const strategy = config.routing.strategy;
   const tried = new Set<string>();
@@ -29,12 +36,12 @@ export async function acquireCredential(opts?: {
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
     // First try: get non-rate-limited credential
     let cred = strategy === 'fill-first'
-      ? getNextCredentialFillFirst(requireProject, provider)
-      : getNextCredential(requireProject, provider);
+      ? getNextCredentialFillFirst({ requireProject, provider, modelName, requireValid })
+      : getNextCredential({ requireProject, provider, modelName, requireValid });
 
     // Second try: if no non-rate-limited cred, use any including rate-limited ones
     if (!cred) {
-      cred = getAnyCredential(requireProject, provider);
+      cred = getAnyCredential({ requireProject, provider, modelName });
     }
 
     // No credentials at all

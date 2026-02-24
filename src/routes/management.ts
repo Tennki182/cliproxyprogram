@@ -2,7 +2,12 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { readFileSync, writeFileSync } from 'fs';
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import { getConfig, getConfigPath, reloadConfig } from '../config.js';
-import { listCredentials } from '../storage/credentials.js';
+import { 
+  listCredentials, 
+  setCredentialPreview, 
+  setCredentialValidationRequired,
+  clearRateLimit,
+} from '../storage/credentials.js';
 import { getQueueStats } from '../services/queue.js';
 import { resetProviders } from '../services/provider-factory.js';
 import { resetBackend } from '../services/backend-factory.js';
@@ -59,6 +64,17 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
     return {
       accounts: credentials.map(c => {
         const todayStats = usageStats.getTodayStatsForCredential(c.account_id, c.provider || 'gemini');
+        
+        // Calculate active model cooldowns
+        const activeCooldowns: Record<string, number> = {};
+        if (c.model_cooldowns) {
+          for (const [model, timestamp] of Object.entries(c.model_cooldowns)) {
+            if (timestamp > now) {
+              activeCooldowns[model] = timestamp;
+            }
+          }
+        }
+        
         return {
           account_id: c.account_id,
           provider: c.provider || 'gemini',
@@ -69,6 +85,10 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
           rate_limited_until: c.rate_limited_until || 0,
           last_used_at: c.last_used_at || 0,
           proxy_url: c.proxy_url || null,
+          preview: c.preview !== false, // default to true
+          validation_required: c.validation_required || false,
+          validation_url: c.validation_url || null,
+          model_cooldowns: activeCooldowns,
           today_requests: todayStats.totalRequests,
           today_tokens: todayStats.totalTokens,
         };
@@ -338,6 +358,79 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
       return { success: true, provider, model, action, excludedModels: list };
     } catch (e: any) {
       return reply.status(500).send({ error: '更新 config.yaml 失败: ' + e.message });
+    }
+  });
+
+  /**
+   * PATCH /v0/management/accounts/:account_id/preview — Set preview status for a credential
+   * Body: { preview: boolean }
+   */
+  fastify.patch<{
+    Params: { account_id: string };
+    Body: { preview: boolean };
+  }>('/v0/management/accounts/:account_id/preview', async (request, reply) => {
+    const { account_id } = request.params;
+    const { preview } = request.body;
+
+    if (typeof preview !== 'boolean') {
+      return reply.status(400).send({ error: 'preview 必须是布尔值' });
+    }
+
+    try {
+      setCredentialPreview(account_id, preview, 'gemini');
+      return { 
+        success: true, 
+        account_id, 
+        preview,
+        message: `凭证 ${account_id} 的 preview 状态已设置为 ${preview}` 
+      };
+    } catch (e: any) {
+      return reply.status(500).send({ error: '更新 preview 状态失败: ' + e.message });
+    }
+  });
+
+  /**
+   * POST /v0/management/accounts/:account_id/validate — Clear validation required status
+   * Call this after manually verifying the account
+   */
+  fastify.post<{
+    Params: { account_id: string };
+  }>('/v0/management/accounts/:account_id/validate', async (request, reply) => {
+    const { account_id } = request.params;
+
+    try {
+      setCredentialValidationRequired(account_id, false, undefined, 'gemini');
+      // Also clear any rate limit
+      clearRateLimit(account_id, 'gemini');
+      
+      return { 
+        success: true, 
+        account_id,
+        message: `凭证 ${account_id} 的验证状态已清除，可以重新使用` 
+      };
+    } catch (e: any) {
+      return reply.status(500).send({ error: '清除验证状态失败: ' + e.message });
+    }
+  });
+
+  /**
+   * POST /v0/management/accounts/:account_id/reset — Reset credential status (clear errors and cooldowns)
+   */
+  fastify.post<{
+    Params: { account_id: string };
+  }>('/v0/management/accounts/:account_id/reset', async (request, reply) => {
+    const { account_id } = request.params;
+
+    try {
+      clearRateLimit(account_id, 'gemini');
+      
+      return { 
+        success: true, 
+        account_id,
+        message: `凭证 ${account_id} 的状态已重置` 
+      };
+    } catch (e: any) {
+      return reply.status(500).send({ error: '重置凭证状态失败: ' + e.message });
     }
   });
 }

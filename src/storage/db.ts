@@ -93,6 +93,28 @@ function initializeTables(): void {
     // Column already exists
   }
 
+  // Add preview and validation columns
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN preview INTEGER DEFAULT 1`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN validation_required INTEGER DEFAULT 0`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN validation_url TEXT`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    database.run(`ALTER TABLE credentials ADD COLUMN model_cooldowns TEXT DEFAULT '{}' `);
+  } catch {
+    // Column already exists
+  }
+
   // Migrate: drop old UNIQUE(account_id) constraint by rebuilding table.
   // SQLite inline UNIQUE cannot be dropped, must recreate table.
   try {
@@ -115,15 +137,19 @@ function initializeTables(): void {
         provider TEXT DEFAULT 'gemini',
         proxy_url TEXT,
         next_refresh_after INTEGER DEFAULT 0,
-        last_refreshed_at INTEGER DEFAULT 0
+        last_refreshed_at INTEGER DEFAULT 0,
+        preview INTEGER DEFAULT 1,
+        validation_required INTEGER DEFAULT 0,
+        validation_url TEXT,
+        model_cooldowns TEXT DEFAULT '{}'
       )`);
       database.run(`INSERT OR IGNORE INTO credentials_new
         (id, account_id, access_token, refresh_token, expires_at, scope, project_id,
          created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url,
-         next_refresh_after, last_refreshed_at)
+         next_refresh_after, last_refreshed_at, preview, validation_required, validation_url, model_cooldowns)
         SELECT id, account_id, access_token, refresh_token, expires_at, scope, project_id,
          created_at, updated_at, last_used_at, rate_limited_until, provider, proxy_url,
-         0, 0
+         0, 0, 1, 0, NULL, '{}'
         FROM credentials`);
       database.run(`DROP TABLE credentials`);
       database.run(`ALTER TABLE credentials_new RENAME TO credentials`);

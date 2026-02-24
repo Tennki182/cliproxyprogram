@@ -56,7 +56,7 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
       logReq(`OpenAI ${stream ? 'stream' : 'req'} → ${provider.name}/${model}`, { format: 'openai', model, stream });
 
       // Get credential for usage tracking
-      const credential = await acquireCredential({ provider: provider.name });
+      const credential = await acquireCredential({ provider: provider.name, modelName: model });
 
       // Handle streaming
       if (body.stream) {

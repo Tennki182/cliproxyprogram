@@ -467,6 +467,7 @@ function selectModel(id) {
 
 // ========== Credentials ==========
 async function loadCredentials() {
+  // Load accounts from /auth/accounts (now includes all fields)
   const r = await rpc('/auth/accounts');
   const accounts = r.data?.accounts || [];
 
@@ -502,7 +503,7 @@ async function loadCredentials() {
         <button class="btn btn-secondary btn-sm" onclick="startAuth('${pd.authFn}')">${pd.btnLabel}</button>
       </div>`;
     } else {
-      html += '<div class="table-wrapper"><table class="data-table"><thead><tr><th>账户</th><th>项目 ID</th><th>状态</th><th>刷新令牌</th>' + (hasProxy ? '<th>代理</th>' : '') + '<th></th></tr></thead><tbody>';
+      html += '<div class="table-wrapper"><table class="data-table"><thead><tr><th>账户</th><th>项目 ID</th><th>状态</th><th>刷新令牌</th>' + (hasProxy ? '<th>代理</th>' : '') + '<th>Preview</th><th>验证</th><th></th></tr></thead><tbody>';
       items.forEach(c => {
         const status = c.expires_at ? (c.expires_at > Date.now() ? 'valid' : 'expired') : 'permanent';
         const statusClass = status === 'valid' ? 'success' : status === 'expired' ? 'error' : 'warning';
@@ -510,6 +511,29 @@ async function loadCredentials() {
         const hasRefresh = c.has_refresh_token ? '有' : '无';
         const project = c.project_id ? `<code>${esc(c.project_id)}</code>` : '<span class="text-muted">无</span>';
         const proxy = hasProxy ? `<td>${c.proxy_url ? `<code>${esc(c.proxy_url)}</code>` : '-'}</td>` : '';
+        
+        // Preview status
+        const previewStatus = c.preview !== false; // default true
+        const previewClass = previewStatus ? 'success' : 'error';
+        const previewText = previewStatus ? '✓' : '✗';
+        const previewTitle = previewStatus ? '支持 Preview' : '不支持 Preview';
+        
+        // Validation status
+        const needsValidation = c.validation_required;
+        let validationCell = '<span class="text-muted">-</span>';
+        if (needsValidation) {
+          const validateUrl = c.validation_url ? 
+            `<a href="${esc(c.validation_url)}" target="_blank" class="btn btn-secondary btn-xs" style="font-size:10px;padding:2px 6px;">验证</a>` : 
+            '';
+          validationCell = `<span class="status-badge error" title="需要账号验证">!</span> ${validateUrl}`;
+        }
+        
+        // Actions
+        const actions = [];
+        if (needsValidation) {
+          actions.push(`<button class="btn btn-secondary btn-xs" onclick="clearValidation('${esc(c.account_id)}')" title="清除验证状态">已验证</button>`);
+        }
+        actions.push(`<button class="btn btn-icon btn-sm" onclick="deleteCredential('${esc(c.account_id)}','${esc(c.provider||'gemini')}')" title="删除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>`);
 
         html += `<tr>
           <td><code>${esc(c.account_id)}</code></td>
@@ -517,7 +541,9 @@ async function loadCredentials() {
           <td><span class="status-badge ${statusClass}">${statusText}</span></td>
           <td>${hasRefresh}</td>
           ${proxy}
-          <td><button class="btn btn-icon btn-sm" onclick="deleteCredential('${esc(c.account_id)}','${esc(c.provider||'gemini')}')" title="删除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></td>
+          <td><span class="status-badge ${previewClass}" title="${previewTitle}">${previewText}</span></td>
+          <td>${validationCell}</td>
+          <td>${actions.join(' ')}</td>
         </tr>`;
       });
       html += '</tbody></table></div>';
@@ -526,6 +552,18 @@ async function loadCredentials() {
   });
 
   list.innerHTML = html;
+}
+
+async function clearValidation(accountId) {
+  const r = await rpc(`/v0/management/accounts/${encodeURIComponent(accountId)}/validate`, {
+    method: 'POST'
+  });
+  if (r.ok) {
+    toast('验证状态已清除', 'success');
+    loadCredentials();
+  } else {
+    toast('操作失败: ' + (r.data?.error || ''), 'error');
+  }
 }
 
 async function deleteCredential(id, provider) {
