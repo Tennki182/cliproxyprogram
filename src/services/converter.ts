@@ -506,15 +506,15 @@ export function convertToolsToGemini(
         description: tool.function.description || '',
         parametersJsonSchema: cleanSchemaForGemini(tool.function.parameters),
       });
-    } else if (tool?.google_search) {
-      // Google Search tool
-      specialTools.push({ googleSearch: tool.google_search });
-    } else if (tool.code_execution) {
-      // Code Execution tool
-      specialTools.push({ codeExecution: tool.code_execution });
-    } else if (tool.url_context) {
-      // URL Context tool
-      specialTools.push({ urlContext: tool.url_context });
+    } else if (tool?.google_search || tool?.googleSearch) {
+      // Google Search tool - support both snake_case and camelCase
+      specialTools.push({ googleSearch: tool.google_search || tool.googleSearch });
+    } else if (tool?.code_execution || tool?.codeExecution) {
+      // Code Execution tool - support both snake_case and camelCase
+      specialTools.push({ codeExecution: tool.code_execution || tool.codeExecution });
+    } else if (tool?.url_context || tool?.urlContext) {
+      // URL Context tool - support both snake_case and camelCase
+      specialTools.push({ urlContext: tool.url_context || tool.urlContext });
     }
   }
 

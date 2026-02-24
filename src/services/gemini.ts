@@ -102,6 +102,11 @@ function parseValidationError(errorBody: string): { isValidationError: boolean; 
 /**
  * Parse cooldown from error response
  * Returns cooldown until timestamp (seconds) or null if no cooldown
+ * 
+ * Enhanced parsing supports:
+ * 1. RetryInfo.retryDelay (e.g., "60s" or { seconds: 60 })
+ * 2. ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
+ * 3. Error message patterns like "Your quota will reset after Xs."
  */
 function parseCooldown(errorBody: string): number | null {
   try {
@@ -119,13 +124,34 @@ function parseCooldown(errorBody: string): number | null {
               // Parse retryDelay (format: "60s" or { seconds: 60 })
               let seconds = 0;
               if (typeof retryDelay === 'string') {
-                const match = retryDelay.match(/(\d+)s/);
-                if (match) seconds = parseInt(match[1], 10);
+                const match = retryDelay.match(/(\d+(?:\.\d+)?)s/);
+                if (match) seconds = Math.ceil(parseFloat(match[1]));
               } else if (retryDelay.seconds) {
                 seconds = parseInt(retryDelay.seconds, 10);
               }
               if (seconds > 0) {
                 return Math.floor(Date.now() / 1000) + seconds;
+              }
+            }
+          }
+          
+          // Fallback: try ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
+          if (detail['@type']?.includes('ErrorInfo')) {
+            const quotaResetDelay = detail.metadata?.quotaResetDelay;
+            if (quotaResetDelay) {
+              // Parse duration string like "373.801628ms" or "0.847655010s"
+              let milliseconds = 0;
+              if (typeof quotaResetDelay === 'string') {
+                const msMatch = quotaResetDelay.match(/(\d+(?:\.\d+)?)ms/);
+                const sMatch = quotaResetDelay.match(/(\d+(?:\.\d+)?)s/);
+                if (msMatch) {
+                  milliseconds = parseFloat(msMatch[1]);
+                } else if (sMatch) {
+                  milliseconds = parseFloat(sMatch[1]) * 1000;
+                }
+              }
+              if (milliseconds > 0) {
+                return Math.floor(Date.now() / 1000) + Math.ceil(milliseconds / 1000);
               }
             }
           }
@@ -138,6 +164,12 @@ function parseCooldown(errorBody: string): number | null {
                            errorMsg.match(/retry\s+after\s+(\d+)\s*seconds/i);
       if (cooldownMatch) {
         return Math.floor(Date.now() / 1000) + parseInt(cooldownMatch[1], 10);
+      }
+      
+      // Fallback: parse from error.message "Your quota will reset after Xs."
+      const resetMatch = errorMsg.match(/after\s+(\d+)s\.?/i);
+      if (resetMatch) {
+        return Math.floor(Date.now() / 1000) + parseInt(resetMatch[1], 10);
       }
     }
   } catch {

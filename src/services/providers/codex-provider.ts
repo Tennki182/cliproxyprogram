@@ -2,6 +2,29 @@ import { Provider } from '../provider.js';
 import { pfetch } from '../http.js';
 import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getCodexOAuthConfig, getConfig } from '../../config.js';
+import { randomUUID } from 'crypto';
+import { countMessagesTokens, estimateTokens } from '../token-counter.js';
+
+// Codex cache for prompt_cache_key
+interface CodexCache {
+  id: string;
+  expire: number;
+}
+const codexCacheMap = new Map<string, CodexCache>();
+
+function getCodexCache(key: string): CodexCache | undefined {
+  const cache = codexCacheMap.get(key);
+  if (!cache) return undefined;
+  if (Date.now() > cache.expire) {
+    codexCacheMap.delete(key);
+    return undefined;
+  }
+  return cache;
+}
+
+function setCodexCache(key: string, cache: CodexCache): void {
+  codexCacheMap.set(key, cache);
+}
 
 function generateId(): string {
   return 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
@@ -152,7 +175,49 @@ function processToolChoice(toolChoice: any, shortNameMap: Map<string, string>): 
 export class CodexProvider implements Provider {
   readonly name = 'codex';
 
+  private getCacheKey(request: any, model: string): string | null {
+    // Only enable cache for Claude-style requests with metadata.user_id
+    const userId = request.metadata?.user_id;
+    if (userId) {
+      return `${model}-${userId}`;
+    }
+    // Or for requests with explicit prompt_cache_key
+    if (request.prompt_cache_key) {
+      return request.prompt_cache_key;
+    }
+    return null;
+  }
+
+  private applyCache(body: any, cacheKey: string | null, request: any): { body: any; cacheId: string | null } {
+    let cacheId: string | null = null;
+    let newBody = body;
+    
+    if (cacheKey) {
+      let cache = getCodexCache(cacheKey);
+      if (!cache) {
+        cache = {
+          id: randomUUID(),
+          expire: Date.now() + 60 * 60 * 1000, // 1 hour
+        };
+        setCodexCache(cacheKey, cache);
+      }
+      cacheId = cache.id;
+      newBody = { ...body, prompt_cache_key: cacheId };
+    } else if (request.prompt_cache_key) {
+      // Use provided cache key directly
+      cacheId = request.prompt_cache_key;
+      newBody = { ...body, prompt_cache_key: cacheId };
+    }
+    
+    return { body: newBody, cacheId };
+  }
+
   async chatCompletion(model: string, request: any): Promise<any> {
+    // Check for /responses/compact endpoint
+    if (request.compact === true || request.stream === false) {
+      return this.executeCompact(model, request);
+    }
+
     const cred = await acquireCredential({ requireProject: false, provider: 'codex' });
     if (!cred) {
       throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
@@ -176,7 +241,7 @@ export class CodexProvider implements Provider {
     const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
     // Codex API 强制要求 stream: true
-    const body: any = {
+    let body: any = {
       model,
       stream: true,
       input,
@@ -213,14 +278,26 @@ export class CodexProvider implements Provider {
       }
     }
 
+    // Apply cache
+    const cacheKey = this.getCacheKey(request, model);
+    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+    body = finalBody;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${cred.access_token}`,
+      'User-Agent': 'codex_cli_rs/0.101.0',
+      'Accept': 'text/event-stream',
+    };
+    
+    if (cacheId) {
+      headers['Conversation_id'] = cacheId;
+      headers['Session_id'] = cacheId;
+    }
+
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${cred.access_token}`,
-        'User-Agent': 'codex_cli_rs/0.101.0',
-        'Accept': 'text/event-stream',
-      },
+      headers,
       body: JSON.stringify(body),
     }, { proxyUrl: cred.proxy_url || undefined });
 
@@ -283,7 +360,7 @@ export class CodexProvider implements Provider {
       throw new Error('Codex 流未返回 response.completed 事件');
     }
 
-    return this.responsesApiToOpenAI(model, completedData, reverseMap, reasoningText);
+    return this.responsesApiToOpenAI(model, completedData, reverseMap, reasoningText, request);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
@@ -309,7 +386,7 @@ export class CodexProvider implements Provider {
     
     const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
-    const body: any = {
+    let body: any = {
       model,
       stream: true,
       input,
@@ -346,14 +423,26 @@ export class CodexProvider implements Provider {
       }
     }
 
+    // Apply cache
+    const cacheKey = this.getCacheKey(request, model);
+    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+    body = finalBody;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${cred.access_token}`,
+      'User-Agent': 'codex_cli_rs/0.101.0',
+      'Accept': 'text/event-stream',
+    };
+    
+    if (cacheId) {
+      headers['Conversation_id'] = cacheId;
+      headers['Session_id'] = cacheId;
+    }
+
     const response = await pfetch(`${codexConfig.apiBase}/responses`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${cred.access_token}`,
-        'User-Agent': 'codex_cli_rs/0.101.0',
-        'Accept': 'text/event-stream',
-      },
+      headers,
       body: JSON.stringify(body),
     }, { proxyUrl: cred.proxy_url || undefined });
 
@@ -530,6 +619,102 @@ export class CodexProvider implements Provider {
     return parseStream();
   }
 
+  /**
+   * Execute compact request (non-streaming, for /responses/compact)
+   */
+  private async executeCompact(model: string, request: any): Promise<any> {
+    const cred = await acquireCredential({ requireProject: false, provider: 'codex' });
+    if (!cred) {
+      throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
+    }
+
+    const codexConfig = getCodexOAuthConfig();
+    
+    // Build tool name shortening map
+    const originalToolNames: string[] = [];
+    if (request.tools) {
+      for (const t of request.tools) {
+        if (t.type === 'function' && t.function?.name) {
+          originalToolNames.push(t.function.name);
+        }
+      }
+    }
+    const shortNameMap = buildShortNameMap(originalToolNames);
+    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
+    
+    const input = convertToResponsesInput(request.messages || [], shortNameMap);
+
+    let body: any = {
+      model,
+      input,
+      instructions: request.messages?.find((m: any) => m.role === 'system')?.content ?? '',
+      store: false,
+      parallel_tool_calls: true,
+      reasoning: {
+        effort: request.reasoning_effort || 'medium',
+        summary: 'auto',
+      },
+    };
+    
+    // Add tools if provided
+    if (request.tools && request.tools.length > 0) {
+      body.tools = request.tools
+        .filter((t: any) => t.type === 'function')
+        .map((t: any) => {
+          const shortName = shortNameMap.get(t.function.name) || t.function.name;
+          return {
+            type: 'function',
+            name: shortName,
+            description: t.function.description || '',
+            parameters: t.function.parameters || { type: 'object', properties: {} },
+            strict: false,
+          };
+        });
+      
+      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      
+      if (body.tools.length === 0) {
+        delete body.tools;
+        delete body.tool_choice;
+      }
+    }
+
+    // Apply cache
+    const cacheKey = this.getCacheKey(request, model);
+    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+    body = finalBody;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${cred.access_token}`,
+      'User-Agent': 'codex_cli_rs/0.101.0',
+      'Accept': 'application/json',
+    };
+    
+    if (cacheId) {
+      headers['Conversation_id'] = cacheId;
+      headers['Session_id'] = cacheId;
+    }
+
+    const response = await pfetch(`${codexConfig.apiBase}/responses/compact`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    }, { proxyUrl: cred.proxy_url || undefined });
+
+    if (!response.ok) {
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
+        reportRateLimit(cred.account_id, retryAfter);
+      }
+      const errorText = await response.text();
+      throw new Error(`Codex API 错误 (${response.status}): ${errorText}`);
+    }
+
+    const data = await response.json();
+    return this.responsesApiToOpenAI(model, data, reverseMap, undefined, request);
+  }
+
   isModelSupported(model: string): boolean {
     const config = getConfig();
     return config.codex.supportedModels.some((m: string) => model.includes(m));
@@ -542,7 +727,8 @@ export class CodexProvider implements Provider {
     model: string, 
     data: any, 
     reverseNameMap?: Map<string, string>,
-    reasoningText?: string
+    reasoningText?: string,
+    originalRequest?: any
   ): any {
     const choice: any = {
       index: 0,
@@ -590,6 +776,12 @@ export class CodexProvider implements Provider {
       }
     }
 
+    // Calculate usage - prefer API returned values, fallback to estimation
+    const promptTokens = data.usage?.input_tokens ?? 
+      (originalRequest ? countMessagesTokens(originalRequest.messages || []) : 0);
+    const completionTokens = data.usage?.output_tokens ?? 
+      estimateTokens(choice.message.content || '');
+
     return {
       id: data.id || generateId(),
       object: 'chat.completion',
@@ -597,9 +789,10 @@ export class CodexProvider implements Provider {
       model,
       choices: [choice],
       usage: {
-        prompt_tokens: data.usage?.input_tokens || 0,
-        completion_tokens: data.usage?.output_tokens || 0,
-        total_tokens: (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: data.usage?.total_tokens ?? (promptTokens + completionTokens),
+        ...(data.usage?.input_tokens ? {} : { estimated: true }),
       },
       system_fingerprint: `fp_${model.replace(/[^a-z0-9]/g, '_')}`,
     };
