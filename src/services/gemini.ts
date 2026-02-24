@@ -32,7 +32,7 @@ const DEFAULT_HEADERS: Record<string, string> = {
 
 // Retry configuration
 const MAX_RETRIES = 5;
-const RETRY_INTERVAL_MS = 100; // 100ms between retries
+// RETRY_INTERVAL_MS removed - now using immediate credential switch for 429 errors
 
 /**
  * Build the API URL for cloudcode-pa.googleapis.com/v1internal
@@ -64,6 +64,20 @@ async function getCredential(opts?: AcquireCredentialOptions): Promise<Credentia
     accountId: credential.account_id,
     credential,
   };
+}
+
+/**
+ * Check if error is a "No capacity available" error that needs immediate credential switch
+ */
+function isNoCapacityError(errorBody: string): boolean {
+  try {
+    const errorJson = JSON.parse(errorBody);
+    const errorMsg = errorJson.error?.message || '';
+    return errorMsg.includes('No capacity available') || 
+           errorMsg.includes('RESOURCE_EXHAUSTED');
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -215,14 +229,24 @@ async function requestWithRetry(
         if ((statusCode === 429 || statusCode === 503) && attempt < MAX_RETRIES) {
           const cooldownUntil = parseCooldownFromError(errorText);
           
+          // Check if this is a "No capacity available" error - switch credential immediately
+          if (isNoCapacityError(errorText)) {
+            const shortCooldown = Math.floor(Date.now() / 1000) + 30; // 30s cooldown for capacity issues
+            logWarn(`凭证 ${accountId} 容量不足 (No capacity)，模型: ${modelName}，立即切换凭证`);
+            setModelCooldown(accountId, modelName, shortCooldown, 'gemini');
+            // Don't wait, immediately try next credential
+            continue;
+          }
+          
           if (cooldownUntil) {
             // Has cooldown - set model cooldown and try next credential
             logWarn(`凭证 ${accountId} 触发冷却，模型: ${modelName}，冷却至: ${new Date(cooldownUntil).toISOString()}`);
             setModelCooldown(accountId, modelName, Math.floor(cooldownUntil / 1000), 'gemini');
           } else {
-            // No cooldown info - short retry with same credential
-            logWarn(`凭证 ${accountId} 返回 ${statusCode}，无冷却时间，短暂后重试...`);
-            await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS * (attempt + 1)));
+            // No cooldown info - mark with short cooldown and try next credential immediately
+            const shortCooldown = Math.floor(Date.now() / 1000) + 10; // 10s cooldown
+            logWarn(`凭证 ${accountId} 返回 ${statusCode}，无冷却时间，立即切换凭证`);
+            setModelCooldown(accountId, modelName, shortCooldown, 'gemini');
           }
           continue;
         }
