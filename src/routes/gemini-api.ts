@@ -4,7 +4,7 @@ import { enqueue } from '../services/queue.js';
 import { recordRequest } from './management.js';
 import { logReq, logError } from '../services/log-stream.js';
 import { createSSEKeepAlive } from '../services/sse-utils.js';
-import { decodeToolIdAndSignature } from '../services/converter.js';
+import { decodeToolIdAndSignature, reverseTransformArgs, registerToolSchemas, clearToolSchemaCache } from '../services/converter.js';
 
 /**
  * Gemini-native API endpoints.
@@ -50,6 +50,9 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
   const { provider, resolvedModel } = providerResult;
   logReq(`Gemini req → ${provider.name}/${resolvedModel}`, { format: 'gemini', model: resolvedModel, stream: false });
 
+  // Register tool schemas for type fixing
+  registerToolSchemas(body.tools);
+
   const messages = geminiContentsToMessages(body.contents, body.systemInstruction);
   const openaiRequest: any = {
     model: resolvedModel,
@@ -67,6 +70,13 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
     if (body.generationConfig.responseMimeType !== undefined) openaiRequest.response_mime_type = body.generationConfig.responseMimeType;
     if (body.generationConfig.responseSchema !== undefined) openaiRequest.response_schema = body.generationConfig.responseSchema;
   }
+  // Pass tools through for provider to handle
+  if (body.tools) {
+    openaiRequest.tools = body.tools;
+  }
+  if (body.toolConfig) {
+    openaiRequest.tool_choice = body.toolConfig;
+  }
 
   try {
     const openaiResponse = await enqueue(() => provider.chatCompletion(resolvedModel, openaiRequest));
@@ -76,6 +86,8 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
     logError(`Gemini req 失败: ${error.message}`, { model: resolvedModel });
     recordRequest(false);
     return reply.status(500).send({ error: { message: error.message } });
+  } finally {
+    clearToolSchemaCache();
   }
 }
 
@@ -89,6 +101,9 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
 
   const { provider, resolvedModel } = providerResult;
   logReq(`Gemini stream → ${provider.name}/${resolvedModel}`, { format: 'gemini', model: resolvedModel, stream: true });
+
+  // Register tool schemas for type fixing
+  registerToolSchemas(body.tools);
 
   const messages = geminiContentsToMessages(body.contents, body.systemInstruction);
   const openaiRequest: any = {
@@ -106,6 +121,13 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
     if (body.generationConfig.presencePenalty !== undefined) openaiRequest.presence_penalty = body.generationConfig.presencePenalty;
     if (body.generationConfig.responseMimeType !== undefined) openaiRequest.response_mime_type = body.generationConfig.responseMimeType;
     if (body.generationConfig.responseSchema !== undefined) openaiRequest.response_schema = body.generationConfig.responseSchema;
+  }
+  // Pass tools through for provider to handle
+  if (body.tools) {
+    openaiRequest.tools = body.tools;
+  }
+  if (body.toolConfig) {
+    openaiRequest.tool_choice = body.toolConfig;
   }
 
   try {
@@ -142,6 +164,8 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
       return reply;
     }
     return reply.status(500).send({ error: { message: error.message } });
+  } finally {
+    clearToolSchemaCache();
   }
 }
 
@@ -198,14 +222,18 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
       messages.push({
         role: 'assistant',
         content: null,
-        tool_calls: fcParts.map((p: any, i: number) => ({
-          id: `call_${messages.length}_${i}`,
-          type: 'function',
-          function: {
-            name: p.functionCall.name,
-            arguments: JSON.stringify(p.functionCall.args),
-          },
-        })),
+        tool_calls: fcParts.map((p: any, i: number) => {
+          // Apply reverse transform to convert string values back to native types
+          const args = reverseTransformArgs(p.functionCall.args);
+          return {
+            id: `call_${messages.length}_${i}`,
+            type: 'function',
+            function: {
+              name: p.functionCall.name,
+              arguments: JSON.stringify(args),
+            },
+          };
+        }),
       });
     }
 
@@ -260,10 +288,20 @@ function openaiResponseToGemini(openai: any): any {
       // Decode tool ID to get original ID without encoded signature
       const { toolId: _toolId, signature } = decodeToolIdAndSignature(tc.id);
       
+      // Parse arguments and apply reverse transform
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(tc.function.arguments);
+        // Apply reverse transform to convert string values back to native types
+        args = reverseTransformArgs(args) as Record<string, unknown>;
+      } catch {
+        args = {};
+      }
+      
       const part: any = {
         functionCall: {
           name: tc.function.name,
-          args: JSON.parse(tc.function.arguments),
+          args,
         },
       };
       
@@ -302,12 +340,15 @@ function openaiChunkToGemini(chunk: any): any {
   }
   if (choice?.delta?.tool_calls) {
     for (const tc of choice.delta.tool_calls) {
-      let args: any = {};
+      let args: Record<string, unknown> = {};
       try {
-        args = JSON.parse(tc.function.arguments);
+        const parsed = JSON.parse(tc.function.arguments);
+        // Apply reverse transform to convert string values back to native types
+        args = reverseTransformArgs(parsed) as Record<string, unknown>;
       } catch {
-        // Streaming chunks may have partial JSON; pass as-is
-        args = tc.function.arguments;
+        // Streaming chunks may have partial JSON; use empty object
+        // The next chunk will have the complete arguments
+        args = {};
       }
       
       // Decode tool ID to get original ID without encoded signature

@@ -7,6 +7,7 @@ import { recordUsage } from '../services/usage.js';
 import { logReq, logError } from '../services/log-stream.js';
 import { createSSEKeepAlive } from '../services/sse-utils.js';
 import { acquireCredential } from '../services/rotation.js';
+import { registerToolSchemas, clearToolSchemaCache } from '../services/converter.js';
 
 export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
   /**
@@ -52,14 +53,17 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       const { provider, resolvedModel: model } = providerResult;
-      const stream = body.stream;
-      logReq(`OpenAI ${stream ? 'stream' : 'req'} → ${provider.name}/${model}`, { format: 'openai', model, stream });
+      const isStream = body.stream;
+      logReq(`OpenAI ${isStream ? 'stream' : 'req'} → ${provider.name}/${model}`, { format: 'openai', model, stream: isStream });
+
+      // Register tool schemas for type fixing in subsequent requests
+      registerToolSchemas(body.tools);
 
       // Get credential for usage tracking
       const credential = await acquireCredential({ provider: provider.name, modelName: model });
 
       // Handle streaming
-      if (body.stream) {
+      if (isStream) {
         try {
           const stream = await enqueue(() => provider.chatCompletionStream(model, body));
 
@@ -123,6 +127,9 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
           return reply.status(500).send({
             error: { message: error.message || 'Internal server error', type: 'server_error' },
           });
+        } finally {
+          // Clear tool schema cache after request completes
+          clearToolSchemaCache();
         }
       }
 
@@ -158,6 +165,9 @@ export async function openaiRoutes(fastify: FastifyInstance): Promise<void> {
             type: 'server_error',
           },
         });
+      } finally {
+        // Clear tool schema cache after request completes
+        clearToolSchemaCache();
       }
     }
   );

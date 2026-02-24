@@ -170,6 +170,12 @@ export function convertMessagesToContents(
           // Normalize function name for Gemini API compatibility
           const normalizedName = normalizeFunctionName(toolCall.function.name);
           
+          // Fix argument types based on cached tool schema
+          const toolSchema = getToolSchema(normalizedName);
+          if (toolSchema) {
+            args = fixToolCallArgsTypes(args, toolSchema);
+          }
+          
           // Decode tool ID in case it has encoded signature from previous turn
           const { signature } = decodeToolIdAndSignature(toolCall.id);
           
@@ -862,4 +868,253 @@ export function encodeToolCallIdsWithSignatures(message: any): any {
   }));
   
   return result;
+}
+
+// ==================== Tool Call Argument Type Fixing ====================
+
+/**
+ * Fix tool call argument types based on the parameter schema.
+ * Converts string values to their correct types (number, boolean, etc.)
+ * 
+ * This handles cases where Gemini or the client sends arguments as strings
+ * when the schema expects different types.
+ */
+export function fixToolCallArgsTypes(
+  args: Record<string, unknown>,
+  parametersSchema: Record<string, unknown> | undefined,
+  debugLog: boolean = false
+): Record<string, unknown> {
+  if (!args || !parametersSchema) {
+    return args;
+  }
+  
+  const properties = parametersSchema.properties;
+  if (!properties || typeof properties !== 'object') {
+    return args;
+  }
+  
+  const fixedArgs: Record<string, unknown> = {};
+  
+  for (const [key, value] of Object.entries(args)) {
+    if (!(key in properties)) {
+      // Parameter not in schema, keep as-is
+      fixedArgs[key] = value;
+      continue;
+    }
+    
+    const paramSchema = (properties as Record<string, unknown>)[key];
+    if (!paramSchema || typeof paramSchema !== 'object') {
+      fixedArgs[key] = value;
+      continue;
+    }
+    
+    const paramType = (paramSchema as Record<string, unknown>).type;
+    if (typeof paramType !== 'string') {
+      fixedArgs[key] = value;
+      continue;
+    }
+    
+    // Apply type conversion based on schema
+    const converted = convertValueToSchemaType(value, paramType, key);
+    if (debugLog && converted !== value) {
+      console.debug(`[fixToolCallArgsTypes] Converted ${key}: ${JSON.stringify(value)} -> ${JSON.stringify(converted)} (${paramType})`);
+    }
+    fixedArgs[key] = converted;
+  }
+  
+  return fixedArgs;
+}
+
+/**
+ * Convert a value to the specified schema type.
+ */
+function convertValueToSchemaType(
+  value: unknown,
+  paramType: string,
+  _key: string
+): unknown {
+  // Handle null/undefined
+  if (value === null || value === undefined) {
+    return value;
+  }
+  
+  switch (paramType) {
+    case 'number':
+    case 'integer':
+      if (typeof value === 'string') {
+        const num = paramType === 'integer' 
+          ? parseInt(value, 10) 
+          : parseFloat(value);
+        if (!isNaN(num)) {
+          return num;
+        }
+      } else if (typeof value === 'number') {
+        return paramType === 'integer' ? Math.floor(value) : value;
+      }
+      return value;
+      
+    case 'boolean':
+      if (typeof value === 'string') {
+        const lower = value.toLowerCase();
+        if (lower === 'true' || lower === '1' || lower === 'yes') {
+          return true;
+        }
+        if (lower === 'false' || lower === '0' || lower === 'no') {
+          return false;
+        }
+      }
+      return value;
+      
+    case 'string':
+      if (typeof value !== 'string') {
+        return String(value);
+      }
+      return value;
+      
+    case 'array':
+      if (typeof value === 'string') {
+        try {
+          const parsed = JSON.parse(value);
+          if (Array.isArray(parsed)) {
+            return reverseTransformArgs(parsed);
+          }
+        } catch {
+          // Not valid JSON array
+        }
+      }
+      if (Array.isArray(value)) {
+        return reverseTransformArgs(value);
+      }
+      return value;
+      
+    case 'object':
+      if (typeof value === 'string') {
+        try {
+          const parsed = JSON.parse(value);
+          if (typeof parsed === 'object' && parsed !== null) {
+            return reverseTransformArgs(parsed as Record<string, unknown>);
+          }
+        } catch {
+          // Not valid JSON object
+        }
+      }
+      if (typeof value === 'object' && value !== null) {
+        return reverseTransformArgs(value as Record<string, unknown>);
+      }
+      return value;
+      
+    default:
+      return value;
+  }
+}
+
+// ==================== Reverse Transform (Gemini string values -> native types) ====================
+
+/**
+ * Reverse transform a single value from string to native type.
+ * Gemini may return all values as strings, this converts them back.
+ */
+export function reverseTransformValue(value: unknown): unknown {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  
+  // Boolean conversion
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  
+  // Null conversion
+  if (value === 'null') return null;
+  
+  // Number conversion (integers and floats)
+  // Only convert if it looks like a pure number (no leading zeros except "0" or "-0")
+  const trimmed = value.trim();
+  if (trimmed && (trimmed === '0' || trimmed === '-0' || !trimmed.startsWith('0'))) {
+    // Check if it's a valid integer
+    if (/^-?\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      if (!isNaN(num) && num <= Number.MAX_SAFE_INTEGER && num >= Number.MIN_SAFE_INTEGER) {
+        return num;
+      }
+    }
+    // Check if it's a valid float (must have digits after decimal point)
+    if (/^-?\d+\.\d+$/.test(trimmed)) {
+      const num = parseFloat(trimmed);
+      if (!isNaN(num) && isFinite(num)) {
+        return num;
+      }
+    }
+  }
+  
+  // Keep as string
+  return value;
+}
+
+/**
+ * Recursively reverse transform arguments from string values to native types.
+ * Handles nested objects and arrays.
+ */
+export function reverseTransformArgs(args: unknown): unknown {
+  if (args === null || args === undefined) {
+    return args;
+  }
+  
+  // Handle arrays
+  if (Array.isArray(args)) {
+    return args.map(item => reverseTransformArgs(item));
+  }
+  
+  // Handle objects
+  if (typeof args === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+      if (typeof value === 'object' && value !== null) {
+        result[key] = reverseTransformArgs(value);
+      } else {
+        result[key] = reverseTransformValue(value);
+      }
+    }
+    return result;
+  }
+  
+  // Handle primitive values
+  return reverseTransformValue(args);
+}
+
+// ==================== Tool Schema Cache ====================
+
+// Cache for tool parameter schemas (function name -> schema)
+const toolSchemaCache = new Map<string, Record<string, unknown>>();
+
+/**
+ * Register tool schemas for later type fixing.
+ * Call this when processing tools in a request.
+ */
+export function registerToolSchemas(tools: any[] | undefined): void {
+  if (!tools) return;
+  
+  for (const tool of tools) {
+    if (tool?.type === 'function' && tool.function?.name) {
+      const normalizedName = normalizeFunctionName(tool.function.name);
+      if (tool.function.parameters) {
+        toolSchemaCache.set(normalizedName, tool.function.parameters);
+      }
+    }
+  }
+}
+
+/**
+ * Get cached tool schema by function name.
+ */
+export function getToolSchema(functionName: string): Record<string, unknown> | undefined {
+  const normalizedName = normalizeFunctionName(functionName);
+  return toolSchemaCache.get(normalizedName);
+}
+
+/**
+ * Clear tool schema cache.
+ * Call this at the end of a request to free memory.
+ */
+export function clearToolSchemaCache(): void {
+  toolSchemaCache.clear();
 }
