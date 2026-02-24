@@ -4,6 +4,7 @@ import { enqueue } from '../services/queue.js';
 import { recordRequest } from './management.js';
 import { logReq, logError } from '../services/log-stream.js';
 import { createSSEKeepAlive } from '../services/sse-utils.js';
+import { decodeToolIdAndSignature } from '../services/converter.js';
 
 /**
  * Gemini-native API endpoints.
@@ -59,6 +60,12 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
     if (body.generationConfig.temperature !== undefined) openaiRequest.temperature = body.generationConfig.temperature;
     if (body.generationConfig.topP !== undefined) openaiRequest.top_p = body.generationConfig.topP;
     if (body.generationConfig.maxOutputTokens !== undefined) openaiRequest.max_tokens = body.generationConfig.maxOutputTokens;
+    if (body.generationConfig.topK !== undefined) openaiRequest.top_k = body.generationConfig.topK;
+    if (body.generationConfig.seed !== undefined) openaiRequest.seed = body.generationConfig.seed;
+    if (body.generationConfig.frequencyPenalty !== undefined) openaiRequest.frequency_penalty = body.generationConfig.frequencyPenalty;
+    if (body.generationConfig.presencePenalty !== undefined) openaiRequest.presence_penalty = body.generationConfig.presencePenalty;
+    if (body.generationConfig.responseMimeType !== undefined) openaiRequest.response_mime_type = body.generationConfig.responseMimeType;
+    if (body.generationConfig.responseSchema !== undefined) openaiRequest.response_schema = body.generationConfig.responseSchema;
   }
 
   try {
@@ -93,6 +100,12 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
     if (body.generationConfig.temperature !== undefined) openaiRequest.temperature = body.generationConfig.temperature;
     if (body.generationConfig.topP !== undefined) openaiRequest.top_p = body.generationConfig.topP;
     if (body.generationConfig.maxOutputTokens !== undefined) openaiRequest.max_tokens = body.generationConfig.maxOutputTokens;
+    if (body.generationConfig.topK !== undefined) openaiRequest.top_k = body.generationConfig.topK;
+    if (body.generationConfig.seed !== undefined) openaiRequest.seed = body.generationConfig.seed;
+    if (body.generationConfig.frequencyPenalty !== undefined) openaiRequest.frequency_penalty = body.generationConfig.frequencyPenalty;
+    if (body.generationConfig.presencePenalty !== undefined) openaiRequest.presence_penalty = body.generationConfig.presencePenalty;
+    if (body.generationConfig.responseMimeType !== undefined) openaiRequest.response_mime_type = body.generationConfig.responseMimeType;
+    if (body.generationConfig.responseSchema !== undefined) openaiRequest.response_schema = body.generationConfig.responseSchema;
   }
 
   try {
@@ -133,6 +146,31 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
 }
 
 /**
+ * Build a tool call tracking map from messages
+ * Maps normalized function names to tool call IDs
+ */
+function buildToolCallTrackingMap(messages: any[]): Map<string, string> {
+  const map = new Map<string, string>();
+  
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        if (tc.function?.name && tc.id) {
+          // Store mapping from normalized name to tool ID
+          const normalizedName = tc.function.name.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+          // If same function called multiple times, keep the first (oldest) mapping
+          if (!map.has(normalizedName)) {
+            map.set(normalizedName, tc.id);
+          }
+        }
+      }
+    }
+  }
+  
+  return map;
+}
+
+/**
  * Convert Gemini contents array to OpenAI messages.
  */
 function geminiContentsToMessages(contents: any[], systemInstruction?: any): any[] {
@@ -144,6 +182,7 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
     if (text) messages.push({ role: 'system', content: text });
   }
 
+  // First pass: collect all messages
   for (const c of (contents || [])) {
     const role = c.role === 'model' ? 'assistant' : 'user';
     const textParts = (c.parts || []).filter((p: any) => p.text);
@@ -170,26 +209,36 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
       });
     }
 
-    // Handle function responses — match to preceding tool_calls by name
+    // Handle function responses - will be processed in second pass
     const frParts = (c.parts || []).filter((p: any) => p.functionResponse);
     for (const p of frParts) {
-      // Find the matching tool_call_id from previous assistant messages
-      let matchedId = `call_0`;
-      for (let mi = messages.length - 1; mi >= 0; mi--) {
-        const prev = messages[mi];
-        if (prev.tool_calls) {
-          const match = prev.tool_calls.find((tc: any) => tc.function.name === p.functionResponse.name);
-          if (match) {
-            matchedId = match.id;
-            break;
-          }
-        }
-      }
+      // Store temporarily with function name for matching
       messages.push({
         role: 'tool',
-        tool_call_id: matchedId,
+        _functionName: p.functionResponse.name,
         content: JSON.stringify(p.functionResponse.response),
       });
+    }
+  }
+
+  // Second pass: match tool responses to tool calls
+  const toolCallMap = buildToolCallTrackingMap(messages);
+  
+  for (const msg of messages) {
+    if (msg.role === 'tool' && msg._functionName) {
+      // Try to find matching tool call by normalized function name
+      const normalizedName = msg._functionName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+      const matchedId = toolCallMap.get(normalizedName);
+      
+      if (matchedId) {
+        msg.tool_call_id = matchedId;
+      } else {
+        // Fallback: use a generated ID
+        msg.tool_call_id = `call_${Math.random().toString(36).substring(2, 10)}`;
+      }
+      
+      // Clean up temporary field
+      delete msg._functionName;
     }
   }
 
@@ -208,12 +257,22 @@ function openaiResponseToGemini(openai: any): any {
   }
   if (choice?.message?.tool_calls) {
     for (const tc of choice.message.tool_calls) {
-      parts.push({
+      // Decode tool ID to get original ID without encoded signature
+      const { toolId: _toolId, signature } = decodeToolIdAndSignature(tc.id);
+      
+      const part: any = {
         functionCall: {
           name: tc.function.name,
           args: JSON.parse(tc.function.arguments),
         },
-      });
+      };
+      
+      // Include thoughtSignature if present
+      if (signature) {
+        part.thoughtSignature = signature;
+      }
+      
+      parts.push(part);
     }
   }
 
@@ -250,12 +309,23 @@ function openaiChunkToGemini(chunk: any): any {
         // Streaming chunks may have partial JSON; pass as-is
         args = tc.function.arguments;
       }
-      parts.push({
+      
+      // Decode tool ID to get original ID without encoded signature
+      const { toolId: _toolId, signature } = decodeToolIdAndSignature(tc.id);
+      
+      const part: any = {
         functionCall: {
           name: tc.function.name,
           args,
         },
-      });
+      };
+      
+      // Include thoughtSignature if present
+      if (signature) {
+        part.thoughtSignature = signature;
+      }
+      
+      parts.push(part);
     }
   }
 

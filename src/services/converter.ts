@@ -12,13 +12,43 @@ import {
   GeminiFunctionResponsePart,
   GeminiThinkingConfig,
 } from '../types/gemini.js';
+import { normalizeFunctionName } from './pinyin.js';
 
 export interface ConvertOptions {
   includeThoughtSignature?: boolean;
 }
 
+// Separator for encoding thoughtSignature in tool_call_id
+const THOUGHT_SIGNATURE_SEPARATOR = '__thought__';
+
+/**
+ * Encode thoughtSignature into tool_call_id to preserve it across round-trips
+ * This ensures the signature is retained even if the client strips custom fields
+ */
+export function encodeToolIdWithSignature(toolId: string, signature: string | null | undefined): string {
+  if (!signature) {
+    return toolId;
+  }
+  return `${toolId}${THOUGHT_SIGNATURE_SEPARATOR}${signature}`;
+}
+
+/**
+ * Decode tool_call_id to extract original tool ID and thoughtSignature
+ */
+export function decodeToolIdAndSignature(encodedId: string): { toolId: string; signature?: string } {
+  if (!encodedId || !encodedId.includes(THOUGHT_SIGNATURE_SEPARATOR)) {
+    return { toolId: encodedId };
+  }
+  const parts = encodedId.split(THOUGHT_SIGNATURE_SEPARATOR);
+  return {
+    toolId: parts[0],
+    signature: parts.length >= 2 ? parts[1] : undefined,
+  };
+}
+
 /**
  * Build a map from tool_call_id to function name from assistant messages
+ * Also tracks thoughtSignatures encoded in tool IDs
  */
 function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string> {
   const map = new Map<string, string>();
@@ -27,8 +57,10 @@ function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string
       const toolCalls = (msg as any).tool_calls;
       if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
-          if (tc.id && tc.function?.name) {
-            map.set(tc.id, tc.function.name);
+          // Decode in case the ID has encoded signature
+          const { toolId } = decodeToolIdAndSignature(tc.id);
+          if (toolId && tc.function?.name) {
+            map.set(toolId, tc.function.name);
           }
         }
       }
@@ -134,15 +166,25 @@ export function convertMessagesToContents(
           } catch {
             args = {};
           }
+          
+          // Normalize function name for Gemini API compatibility
+          const normalizedName = normalizeFunctionName(toolCall.function.name);
+          
+          // Decode tool ID in case it has encoded signature from previous turn
+          const { signature } = decodeToolIdAndSignature(toolCall.id);
+          
           const part: any = {
             functionCall: {
-              name: toolCall.function.name,
+              name: normalizedName,
               args,
             },
           };
+          
           if (includeThought) {
-            part.thoughtSignature = 'skip_thought_signature_validator';
+            // Use existing signature from decoded ID or generate new one
+            part.thoughtSignature = signature || 'skip_thought_signature_validator';
           }
+          
           parts.push(part);
         }
       }
@@ -154,14 +196,19 @@ export function convertMessagesToContents(
     } else if (msg.role === 'tool') {
       // Map tool_call_id to function name
       const toolCallId = (msg as any).tool_call_id;
-      const functionName = toolCallId ? (toolCallIdToName.get(toolCallId) || (msg as any).name) : (msg as any).name;
+      // Decode in case it has encoded signature
+      const { toolId } = decodeToolIdAndSignature(toolCallId);
+      const functionName = toolId ? (toolCallIdToName.get(toolId) || (msg as any).name) : (msg as any).name;
+      
+      // Normalize function name
+      const normalizedName = functionName ? normalizeFunctionName(functionName) : '';
       
       contents.push({
         role: 'user',
         parts: [
           {
             functionResponse: {
-              name: functionName || '',
+              name: normalizedName,
               response: { result: msg.content },
             },
           } as GeminiFunctionResponsePart,
@@ -189,6 +236,113 @@ export function extractSystemInstruction(
 }
 
 /**
+ * Parse thinking settings from model name
+ * Supports model name suffixes like -max, -high, -medium, -low, -minimal
+ */
+export function getThinkingSettingsFromModel(modelName: string): { thinkingBudget?: number; thinkingLevel?: string } | null {
+  const lowerModel = modelName.toLowerCase();
+  
+  // Check for thinking-related suffixes
+  const isGemini25 = lowerModel.includes('gemini-2.5');
+  const isGemini3 = lowerModel.includes('gemini-3');
+  const isFlash = lowerModel.includes('flash');
+  
+  // Handle old-style suffixes
+  if (lowerModel.includes('-nothinking')) {
+    if (isFlash) {
+      return { thinkingBudget: 0 };
+    }
+    return { thinkingBudget: 128 };
+  }
+  
+  if (lowerModel.includes('-maxthinking')) {
+    if (isGemini3) {
+      return { thinkingLevel: 'high' };
+    }
+    const budget = isFlash ? 24576 : 32768;
+    return { thinkingBudget: budget };
+  }
+  
+  // Handle new-style budget/level suffixes
+  if (lowerModel.includes('-max')) {
+    if (isGemini25) {
+      const budget = isFlash ? 24576 : 32768;
+      return { thinkingBudget: budget };
+    } else if (isGemini3) {
+      return { thinkingLevel: 'high' };
+    }
+  }
+  
+  if (lowerModel.includes('-high')) {
+    if (isGemini25) {
+      return { thinkingBudget: 16000 };
+    } else if (isGemini3 && isFlash) {
+      return { thinkingLevel: 'high' };
+    }
+  }
+  
+  if (lowerModel.includes('-medium')) {
+    if (isGemini25) {
+      return { thinkingBudget: 8192 };
+    } else if (isGemini3 && isFlash) {
+      return { thinkingLevel: 'medium' };
+    }
+  }
+  
+  if (lowerModel.includes('-low')) {
+    if (isGemini25) {
+      return { thinkingBudget: 1024 };
+    } else if (isGemini3 && isFlash) {
+      return { thinkingLevel: 'low' };
+    }
+  }
+  
+  if (lowerModel.includes('-minimal')) {
+    if (isGemini25) {
+      const budget = isFlash ? 0 : 128;
+      return { thinkingBudget: budget };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Check if model is a search model
+ */
+export function isSearchModel(modelName: string): boolean {
+  return modelName.toLowerCase().includes('-search');
+}
+
+/**
+ * Get base model name by removing feature suffixes
+ */
+export function getBaseModelName(modelName: string): string {
+  // Order from longest to shortest to avoid partial matches
+  const suffixes = [
+    '-maxthinking', '-nothinking',  // Legacy
+    '-minimal', '-medium', '-search', '-think',  // Medium length
+    '-high', '-max', '-low',  // Short
+  ];
+  
+  let result = modelName;
+  let changed = true;
+  
+  // Keep removing suffixes until no more changes
+  while (changed) {
+    changed = false;
+    for (const suffix of suffixes) {
+      if (result.toLowerCase().endsWith(suffix)) {
+        result = result.slice(0, -suffix.length);
+        changed = true;
+      }
+    }
+  }
+  
+  return result;
+}
+
+/**
  * Convert reasoning_effort to Gemini thinkingConfig
  */
 function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'none'): GeminiThinkingConfig | undefined {
@@ -208,7 +362,35 @@ function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'n
 }
 
 /**
+ * Type guards for additional request parameters
+ */
+function hasTopK(req: any): req is { top_k: number } {
+  return typeof req?.top_k === 'number';
+}
+
+function hasSeed(req: any): req is { seed: number } {
+  return typeof req?.seed === 'number';
+}
+
+function hasFrequencyPenalty(req: any): req is { frequency_penalty: number } {
+  return typeof req?.frequency_penalty === 'number';
+}
+
+function hasPresencePenalty(req: any): req is { presence_penalty: number } {
+  return typeof req?.presence_penalty === 'number';
+}
+
+function hasResponseMimeType(req: any): req is { response_mime_type: string } {
+  return typeof req?.response_mime_type === 'string';
+}
+
+function hasResponseSchema(req: any): req is { response_schema: Record<string, unknown> } {
+  return typeof req?.response_schema === 'object' && req?.response_schema !== null;
+}
+
+/**
  * Convert OpenAI chat completion request config to Gemini generation config
+ * Includes model name-based thinking settings
  */
 export function convertToGeminiConfig(
   request: OpenAIChatCompletionRequest
@@ -233,7 +415,33 @@ export function convertToGeminiConfig(
       : [request.stop];
   }
 
+  // Additional parameters with type guards
+  if (hasTopK(request)) {
+    config.topK = request.top_k;
+  }
+
+  if (hasSeed(request)) {
+    config.seed = request.seed;
+  }
+
+  if (hasFrequencyPenalty(request)) {
+    config.frequencyPenalty = request.frequency_penalty;
+  }
+
+  if (hasPresencePenalty(request)) {
+    config.presencePenalty = request.presence_penalty;
+  }
+
+  if (hasResponseMimeType(request)) {
+    config.responseMimeType = request.response_mime_type;
+  }
+
+  if (hasResponseSchema(request)) {
+    config.responseSchema = request.response_schema;
+  }
+
   // Convert reasoning_effort or thinking_budget to thinkingConfig
+  // First check explicit settings, then parse from model name
   if (request.thinking_budget !== undefined) {
     // Direct thinking budget takes precedence
     config.thinkingConfig = {
@@ -242,6 +450,16 @@ export function convertToGeminiConfig(
     };
   } else if (request.reasoning_effort !== undefined) {
     config.thinkingConfig = convertReasoningEffort(request.reasoning_effort);
+  } else {
+    // Parse thinking settings from model name
+    const modelThinkingSettings = getThinkingSettingsFromModel(request.model);
+    if (modelThinkingSettings) {
+      config.thinkingConfig = {
+        thinkingBudget: modelThinkingSettings.thinkingBudget,
+        thinkingLevel: modelThinkingSettings.thinkingLevel as any,
+        includeThoughts: true,
+      };
+    }
   }
 
   // Convert modalities to responseModalities
@@ -268,6 +486,7 @@ export function convertToGeminiConfig(
 /**
  * Convert OpenAI tools to Gemini format.
  * Supports function declarations and special tools (google_search, code_execution, url_context).
+ * Normalizes function names for Gemini API compatibility.
  */
 export function convertToolsToGemini(
   tools?: any[]
@@ -278,13 +497,16 @@ export function convertToolsToGemini(
   const specialTools: any[] = [];
 
   for (const tool of tools) {
-    if (tool.type === 'function') {
+    if (tool?.type === 'function' && tool.function?.name) {
+      // Normalize function name for Gemini API compatibility
+      const normalizedName = normalizeFunctionName(tool.function.name);
+      
       functionDeclarations.push({
-        name: tool.function.name,
+        name: normalizedName,
         description: tool.function.description || '',
         parametersJsonSchema: cleanSchemaForGemini(tool.function.parameters),
       });
-    } else if (tool.google_search) {
+    } else if (tool?.google_search) {
       // Google Search tool
       specialTools.push({ googleSearch: tool.google_search });
     } else if (tool.code_execution) {
@@ -311,9 +533,37 @@ export function convertToolsToGemini(
 }
 
 /**
- * Clean JSON schema for Gemini compatibility
+ * Resolve $ref in JSON schema
  */
-function cleanSchemaForGemini(schema: Record<string, unknown> | undefined): any {
+function resolveRef(ref: string, rootSchema: Record<string, unknown>): Record<string, unknown> | null {
+  if (!ref.startsWith('#/')) {
+    return null;
+  }
+  
+  const path = ref.slice(2).split('/');
+  let current: any = rootSchema;
+  
+  for (const segment of path) {
+    if (current === undefined || current === null) {
+      return null;
+    }
+    current = current[segment];
+  }
+  
+  return typeof current === 'object' && current !== null ? current : null;
+}
+
+
+
+/**
+ * Clean JSON schema for Gemini compatibility
+ * Includes $ref resolution and cycle detection
+ */
+function cleanSchemaForGemini(
+  schema: Record<string, unknown> | undefined,
+  rootSchema?: Record<string, unknown>,
+  visited?: WeakSet<object>
+): any {
   // Default schema if none provided
   if (!schema || Object.keys(schema).length === 0) {
     return {
@@ -322,68 +572,158 @@ function cleanSchemaForGemini(schema: Record<string, unknown> | undefined): any 
     };
   }
 
-  const cleaned = { ...schema };
+  // Initialize root schema and visited set for cycle detection
+  const root = rootSchema ?? schema;
+  const seen = visited ?? new WeakSet<object>();
+  
+  // Check for circular reference
+  if (seen.has(schema)) {
+    // Return a placeholder for circular references
+    return {
+      type: 'object',
+      description: '(circular reference)',
+    };
+  }
+  
+  // Mark as visited
+  seen.add(schema);
 
-  // Remove fields not supported by Gemini
-  delete cleaned.$ref;
-  delete cleaned.$defs;
-  delete cleaned.definitions;
-  delete cleaned.strict;
-  delete cleaned.$schema;
-  delete cleaned.additionalProperties;
-
-  // Process properties recursively
-  if (cleaned.properties && typeof cleaned.properties === 'object') {
-    const newProps: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(
-      cleaned.properties as Record<string, unknown>
-    )) {
-      newProps[key] = cleanSchemaForGemini(value as Record<string, unknown>);
+  try {
+    // Create a copy to avoid modifying the original
+    let cleaned: Record<string, unknown> = {};
+    
+    // Handle $ref - resolve and merge
+    if (schema.$ref && typeof schema.$ref === 'string') {
+      const resolved = resolveRef(schema.$ref, root);
+      if (resolved) {
+        // Check if resolved schema is already visited (circular through $ref)
+        if (seen.has(resolved)) {
+          return {
+            type: 'object',
+            description: '(circular reference)',
+          };
+        }
+        
+        // Merge resolved schema with current (excluding $ref)
+        cleaned = { ...(resolved as Record<string, unknown>) };
+        for (const [key, value] of Object.entries(schema)) {
+          if (key !== '$ref') {
+            cleaned[key] = value;
+          }
+        }
+      } else {
+        // If resolution fails, copy the schema as-is (minus $ref)
+        for (const [key, value] of Object.entries(schema)) {
+          if (key !== '$ref') {
+            cleaned[key] = value;
+          }
+        }
+      }
+    } else {
+      cleaned = { ...schema };
     }
-    cleaned.properties = newProps;
-  }
 
-  // Process items
-  if (cleaned.items) {
-    cleaned.items = cleanSchemaForGemini(cleaned.items as Record<string, unknown>);
-  }
+    // Remove fields not supported by Gemini
+    delete cleaned.$ref;  // Already handled above
+    delete cleaned.$defs;
+    delete cleaned.definitions;
+    delete cleaned.strict;
+    delete cleaned.$schema;
+    delete cleaned.additionalProperties;
 
-  // Process allOf, anyOf, oneOf - convert to plain properties
-  if (cleaned.allOf) {
-    return mergeAllOf(cleaned.allOf as any[]);
-  }
-  if (cleaned.anyOf) {
-    cleaned.anyOf = (cleaned.anyOf as any[]).map(cleanSchemaForGemini);
-  }
-  if (cleaned.oneOf) {
-    cleaned.oneOf = (cleaned.oneOf as any[]).map(cleanSchemaForGemini);
-  }
+    // Process allOf - merge schemas
+    if (cleaned.allOf && Array.isArray(cleaned.allOf)) {
+      const merged: any = {
+        type: 'object',
+        properties: {},
+        required: [],
+      };
 
-  return cleaned;
-}
+      for (const item of cleaned.allOf) {
+        const cleanedItem = cleanSchemaForGemini(item as Record<string, unknown>, root, seen);
+        if (cleanedItem.properties) {
+          Object.assign(merged.properties, cleanedItem.properties);
+        }
+        if (cleanedItem.required) {
+          merged.required.push(...cleanedItem.required);
+        }
+        // Copy other fields
+        for (const [key, value] of Object.entries(cleanedItem)) {
+          if (key !== 'properties' && key !== 'required') {
+            merged[key] = value;
+          }
+        }
+      }
 
-/**
- * Merge allOf schemas
- */
-function mergeAllOf(allOf: any[]): any {
-  const merged: any = {
-    type: 'object',
-    properties: {},
-    required: [],
-  };
+      // Copy other fields from cleaned (excluding allOf)
+      for (const [key, value] of Object.entries(cleaned)) {
+        if (key !== 'allOf') {
+          if (key === 'properties' && merged.properties && typeof value === 'object' && value !== null) {
+            merged.properties = { ...merged.properties, ...(value as Record<string, unknown>) };
+          } else if (key === 'required' && merged.required) {
+            merged.required = [...merged.required, ...(Array.isArray(value) ? value : [])];
+          } else {
+            merged[key] = value;
+          }
+        }
+      }
 
-  for (const item of allOf) {
-    const cleaned = cleanSchemaForGemini(item);
-    if (cleaned.properties) {
-      Object.assign(merged.properties, cleaned.properties);
+      // Deduplicate required
+      if (merged.required) {
+        merged.required = [...new Set(merged.required)];
+      }
+
+      cleaned = merged;
     }
-    if (cleaned.required) {
-      merged.required.push(...cleaned.required);
-    }
-  }
 
-  merged.required = [...new Set(merged.required)];
-  return merged;
+    // Process properties recursively
+    if (cleaned.properties && typeof cleaned.properties === 'object') {
+      const newProps: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(cleaned.properties as Record<string, unknown>)) {
+        newProps[key] = cleanSchemaForGemini(value as Record<string, unknown>, root, seen);
+      }
+      cleaned.properties = newProps;
+    }
+
+    // Process items
+    if (cleaned.items) {
+      if (Array.isArray(cleaned.items)) {
+        cleaned.items = cleaned.items.map(item => 
+          cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
+        );
+      } else {
+        cleaned.items = cleanSchemaForGemini(cleaned.items as Record<string, unknown>, root, seen);
+      }
+    }
+
+    // Process anyOf
+    if (cleaned.anyOf && Array.isArray(cleaned.anyOf)) {
+      cleaned.anyOf = cleaned.anyOf.map(item => 
+        cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
+      );
+    }
+
+    // Process oneOf
+    if (cleaned.oneOf && Array.isArray(cleaned.oneOf)) {
+      cleaned.oneOf = cleaned.oneOf.map(item => 
+        cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
+      );
+    }
+
+    // Process additionalProperties if it's an object
+    if (cleaned.additionalProperties && typeof cleaned.additionalProperties === 'object') {
+      cleaned.additionalProperties = cleanSchemaForGemini(
+        cleaned.additionalProperties as Record<string, unknown>,
+        root,
+        seen
+      );
+    }
+
+    return cleaned;
+  } finally {
+    // Always remove from visited set when done (even if an error occurs)
+    seen.delete(schema);
+  }
 }
 
 /**
@@ -409,10 +749,12 @@ export function convertToolChoice(toolChoice?: any): GeminiToolConfig | undefine
   }
 
   if (toolChoice.type === 'function' && toolChoice.function?.name) {
+    // Normalize the function name
+    const normalizedName = normalizeFunctionName(toolChoice.function.name);
     return {
       functionCallingConfig: {
         mode: 'ANY',
-        allowedFunctionNames: [toolChoice.function.name],
+        allowedFunctionNames: [normalizedName],
       },
     };
   }
@@ -434,4 +776,90 @@ export function hasImageContent(content: OpenAIMessageContent): boolean {
     return content.some(item => item.type === 'image_url');
   }
   return false;
+}
+
+/**
+ * Prepare image generation request based on model name
+ * Parses resolution and aspect ratio from model name suffixes
+ */
+export function prepareImageGenerationRequest(
+  requestBody: Record<string, any>,
+  model: string
+): Record<string, any> {
+  const result = { ...requestBody };
+  const modelLower = model.toLowerCase();
+  
+  // Parse resolution
+  let imageSize: string | undefined;
+  if (modelLower.includes('-4k')) {
+    imageSize = '4K';
+  } else if (modelLower.includes('-2k')) {
+    imageSize = '2K';
+  }
+  
+  // Parse aspect ratio
+  let aspectRatio: string | undefined;
+  const ratioMap: Record<string, string> = {
+    '-21x9': '21:9',
+    '-16x9': '16:9',
+    '-9x16': '9:16',
+    '-4x3': '4:3',
+    '-3x4': '3:4',
+    '-1x1': '1:1',
+  };
+  
+  for (const [suffix, ratio] of Object.entries(ratioMap)) {
+    if (modelLower.includes(suffix)) {
+      aspectRatio = ratio;
+      break;
+    }
+  }
+  
+  // Build imageConfig
+  const imageConfig: Record<string, string> = {};
+  if (aspectRatio) {
+    imageConfig.aspectRatio = aspectRatio;
+  }
+  if (imageSize) {
+    imageConfig.imageSize = imageSize;
+  }
+  
+  // Update model name to base image model
+  result.model = 'gemini-3-pro-image';
+  result.generationConfig = {
+    candidateCount: 1,
+    imageConfig,
+  };
+  
+  // Remove incompatible fields
+  delete result.systemInstruction;
+  delete result.tools;
+  delete result.toolConfig;
+  
+  return result;
+}
+
+/**
+ * Check if model is an image generation model
+ */
+export function isImageGenerationModel(modelName: string): boolean {
+  return modelName.toLowerCase().includes('-image');
+}
+
+/**
+ * Encode tool call IDs with signatures in assistant message
+ * Call this before sending response back to client
+ */
+export function encodeToolCallIdsWithSignatures(message: any): any {
+  if (!message || !message.tool_calls) {
+    return message;
+  }
+  
+  const result = { ...message };
+  result.tool_calls = message.tool_calls.map((tc: any) => ({
+    ...tc,
+    id: encodeToolIdWithSignature(tc.id, tc.thoughtSignature),
+  }));
+  
+  return result;
 }

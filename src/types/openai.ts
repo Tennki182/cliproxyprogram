@@ -50,7 +50,7 @@ export interface OpenAIChatCompletionRequest {
   tool_choice?: any;
   user?: string;
   // Gemini thinking/reasoning support
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'auto' | 'none';
   thinking_budget?: number;  // Direct thinking budget in tokens (-1 for auto)
   // Image generation support
   modalities?: ('text' | 'image')[];
@@ -58,6 +58,13 @@ export interface OpenAIChatCompletionRequest {
     aspect_ratio?: string;
     image_size?: string;
   };
+  // Additional parameters supported by Gemini
+  top_k?: number;
+  seed?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  response_mime_type?: string;
+  response_schema?: Record<string, unknown>;
 }
 
 export interface OpenAIChatMessage {
@@ -74,6 +81,7 @@ export interface OpenAIToolCall {
     name: string;
     arguments: string;
   };
+  thoughtSignature?: string;  // Internal use for Gemini cloudcode-pa API
 }
 
 export interface OpenAIChatChoice {
@@ -83,6 +91,7 @@ export interface OpenAIChatChoice {
     content: string | null;
     reasoning_content?: string | null;
     tool_calls?: OpenAIToolCall[];
+    images?: any[];  // For image generation responses
   };
   finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
 }

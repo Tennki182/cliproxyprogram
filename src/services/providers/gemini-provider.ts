@@ -7,6 +7,10 @@ import {
   convertToolsToGemini,
   convertToolChoice,
   extractSystemInstruction,
+  encodeToolIdWithSignature,
+  isImageGenerationModel,
+  prepareImageGenerationRequest,
+  getBaseModelName,
 } from '../converter.js';
 
 function generateId(): string {
@@ -28,25 +32,54 @@ export class GeminiProvider implements Provider {
 
   async chatCompletion(model: string, request: any): Promise<any> {
     const backend = this.backendFn();
+    
+    // Handle image generation models
+    let actualModel = model;
+    if (isImageGenerationModel(model)) {
+      actualModel = 'gemini-3-pro-image';
+    }
 
     const contents = convertMessagesToContents(request.messages, {
       includeThoughtSignature: backend.needsThoughtSignature,
     });
     const systemInstruction = extractSystemInstruction(request.messages);
-    const generationConfig = convertToGeminiConfig(request);
+    let generationConfig = convertToGeminiConfig(request);
     const tools = convertToolsToGemini(request.tools);
     const toolConfig = convertToolChoice(request.tool_choice);
 
+    // Handle image generation request transformation
+    if (isImageGenerationModel(model)) {
+      const transformedRequest = prepareImageGenerationRequest(
+        { contents, systemInstruction, generationConfig, tools, toolConfig },
+        model
+      );
+      const response = await backend.generateContent(
+        actualModel,
+        transformedRequest.contents,
+        transformedRequest.systemInstruction,
+        transformedRequest.generationConfig,
+        transformedRequest.tools,
+        transformedRequest.toolConfig
+      );
+      return this.toOpenAIResponse(model, response, true);
+    }
+
     const response = await backend.generateContent(
-      model, contents, systemInstruction, generationConfig, tools, toolConfig
+      actualModel, contents, systemInstruction, generationConfig, tools, toolConfig
     );
 
     // Convert Gemini response to OpenAI format
-    return this.toOpenAIResponse(model, response);
+    return this.toOpenAIResponse(model, response, false, backend.needsThoughtSignature);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
     const backend = this.backendFn();
+    
+    // Handle image generation models
+    let actualModel = model;
+    if (isImageGenerationModel(model)) {
+      actualModel = 'gemini-3-pro-image';
+    }
 
     const contents = convertMessagesToContents(request.messages, {
       includeThoughtSignature: backend.needsThoughtSignature,
@@ -57,17 +90,26 @@ export class GeminiProvider implements Provider {
     const toolConfig = convertToolChoice(request.tool_choice);
 
     const stream = await backend.generateContentStream(
-      model, contents, systemInstruction, generationConfig, tools, toolConfig
+      actualModel, contents, systemInstruction, generationConfig, tools, toolConfig
     );
 
     const self = this;
     const completionId = generateId();
     const timestamp = getTimestamp();
+    const _isImageModel = isImageGenerationModel(model);
 
     async function* convertStream(): AsyncIterable<any> {
       let chunkIndex = 0;
       for await (const chunk of stream) {
-        yield self.toOpenAIChunk(model, chunk, completionId, timestamp, chunkIndex);
+        yield self.toOpenAIChunk(
+          model, 
+          chunk, 
+          completionId, 
+          timestamp, 
+          chunkIndex, 
+          _isImageModel,
+          backend.needsThoughtSignature
+        );
         chunkIndex++;
       }
     }
@@ -77,10 +119,15 @@ export class GeminiProvider implements Provider {
 
   isModelSupported(model: string): boolean {
     const backend = this.backendFn();
-    return backend.isModelSupported(model);
+    return backend.isModelSupported(getBaseModelName(model));
   }
 
-  private toOpenAIResponse(model: string, response: any): any {
+  private toOpenAIResponse(
+    model: string, 
+    response: any, 
+    isImageModel: boolean = false,
+    _needsThoughtSignature: boolean = false
+  ): any {
     const choice: any = {
       index: 0,
       message: { 
@@ -98,6 +145,7 @@ export class GeminiProvider implements Provider {
       const textParts: string[] = [];
       const thoughtParts: string[] = [];
       const toolCalls: any[] = [];
+      const images: any[] = [];
       
       for (const part of parts) {
         if (part.text) {
@@ -107,17 +155,28 @@ export class GeminiProvider implements Provider {
             textParts.push(part.text);
           }
         } else if (part.functionCall) {
+          // Encode thoughtSignature into tool_call_id if present
+          const toolId = encodeToolIdWithSignature(
+            `call_${Date.now()}_${toolCalls.length}`,
+            part.thoughtSignature
+          );
+          
           toolCalls.push({
-            id: `call_${Date.now()}_${toolCalls.length}`,
+            id: toolId,
             type: 'function',
             function: {
               name: part.functionCall.name,
               arguments: JSON.stringify(part.functionCall.args),
             },
+            // Keep thoughtSignature for internal use (will be stripped by JSON.stringify if not needed)
+            thoughtSignature: part.thoughtSignature,
           });
-        } else if (part.inlineData) {
+        } else if (part.inlineData && isImageModel) {
           // Handle image generation response
-          // This would need special handling for image data
+          images.push({
+            data: part.inlineData.data,
+            mimeType: part.inlineData.mimeType,
+          });
         }
       }
       
@@ -133,6 +192,11 @@ export class GeminiProvider implements Provider {
         choice.message.content = null;
         choice.message.tool_calls = toolCalls;
         choice.finish_reason = 'tool_calls';
+      }
+
+      // Add images to response if present
+      if (images.length > 0) {
+        choice.message.images = images;
       }
     }
 
@@ -151,7 +215,15 @@ export class GeminiProvider implements Provider {
     };
   }
 
-  private toOpenAIChunk(model: string, chunk: any, id: string, created: number, index: number): any {
+  private toOpenAIChunk(
+    model: string, 
+    chunk: any, 
+    id: string, 
+    created: number, 
+    index: number,
+    _isImageModel: boolean = false,
+    _needsThoughtSignature: boolean = false
+  ): any {
     const choice: any = {
       index: 0,
       delta: { 
@@ -176,8 +248,14 @@ export class GeminiProvider implements Provider {
             textParts.push(part.text);
           }
         } else if (part.functionCall) {
+          // Encode thoughtSignature into tool_call_id if present
+          const toolId = encodeToolIdWithSignature(
+            `call_${index}_${toolCalls.length}`,
+            part.thoughtSignature
+          );
+          
           toolCalls.push({
-            id: `call_${index}_${toolCalls.length}`,
+            id: toolId,
             type: 'function',
             function: {
               name: part.functionCall.name,

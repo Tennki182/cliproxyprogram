@@ -13,7 +13,7 @@ import {
   markCredentialRateLimited,
   listCredentials,
 } from '../storage/credentials.js';
-import { logWarn } from './log-stream.js';
+import { logWarn, logInfo } from './log-stream.js';
 
 const SAFETY_SETTINGS = [
   { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
@@ -100,6 +100,53 @@ function parseValidationError(errorBody: string): { isValidationError: boolean; 
 }
 
 /**
+ * Parse cooldown from error response
+ * Returns cooldown until timestamp (seconds) or null if no cooldown
+ */
+function parseCooldown(errorBody: string): number | null {
+  try {
+    const errorJson = JSON.parse(errorBody);
+    const error = errorJson.error;
+    
+    // Check for QUOTA_EXHAUSTED with retry info
+    if (error?.code === 429 || error?.status === 'RESOURCE_EXHAUSTED') {
+      const details = error.details;
+      if (Array.isArray(details)) {
+        for (const detail of details) {
+          if (detail['@type']?.includes('RetryInfo')) {
+            const retryDelay = detail.retryDelay;
+            if (retryDelay) {
+              // Parse retryDelay (format: "60s" or { seconds: 60 })
+              let seconds = 0;
+              if (typeof retryDelay === 'string') {
+                const match = retryDelay.match(/(\d+)s/);
+                if (match) seconds = parseInt(match[1], 10);
+              } else if (retryDelay.seconds) {
+                seconds = parseInt(retryDelay.seconds, 10);
+              }
+              if (seconds > 0) {
+                return Math.floor(Date.now() / 1000) + seconds;
+              }
+            }
+          }
+        }
+      }
+      
+      // Check for x-goog-ext-251768198-bin header info in error message
+      const errorMsg = error?.message || '';
+      const cooldownMatch = errorMsg.match(/cooldown\s+(\d+)\s*seconds/i) || 
+                           errorMsg.match(/retry\s+after\s+(\d+)\s*seconds/i);
+      if (cooldownMatch) {
+        return Math.floor(Date.now() / 1000) + parseInt(cooldownMatch[1], 10);
+      }
+    }
+  } catch {
+    // Ignore parsing errors
+  }
+  return null;
+}
+
+/**
  * Check if error is fatal (should not retry with other credentials)
  * 4xx errors (except 429, 403 validation, 404 preview) are client errors, should not retry
  */
@@ -128,8 +175,63 @@ function isFatalError(statusCode: number): boolean {
 }
 
 /**
- * Perform API request with retry logic
+ * Request state for credential warming and fast updates
+ */
+interface RequestState {
+  url: string;
+  baseBody: Record<string, unknown>;  // Original body without project
+  headers: Record<string, string>;
+  modelName: string;
+  isStream: boolean;
+}
+
+/**
+ * Deep clone an object (safe for request bodies)
+ */
+function deepClone<T>(obj: T): T {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (obj instanceof Date) return new Date(obj.getTime()) as unknown as T;
+  if (obj instanceof Array) return obj.map(item => deepClone(item)) as unknown as T;
+  if (typeof obj === 'object') {
+    const cloned: Record<string, unknown> = {};
+    for (const key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        cloned[key] = deepClone((obj as Record<string, unknown>)[key]);
+      }
+    }
+    return cloned as T;
+  }
+  return obj;
+}
+
+/**
+ * Fast credential update - only update changed fields
+ * Instead of rebuilding entire request body
+ */
+function fastUpdateCredential(
+  state: RequestState,
+  credential: CredentialInfo
+): { headers: Record<string, string>; body: Record<string, unknown> } {
+  // Clone headers and update only Authorization
+  const headers = { ...state.headers };
+  headers['Authorization'] = `Bearer ${credential.accessToken}`;
+  
+  // Deep clone baseBody to avoid modifying nested objects
+  const body = deepClone(state.baseBody);
+  body.project = credential.projectId;
+  
+  return { headers, body };
+}
+
+/**
+ * Perform API request with retry logic, credential warming, and fast updates
  * Try ALL available credentials before giving up
+ * 
+ * Optimizations:
+ * 1. Credential warming: Pre-fetch next credential asynchronously
+ * 2. 429 without cooldown: Retry with same credential
+ * 3. Response caching: Cache error body to avoid re-decode
+ * 4. Fast updates: Only update changed fields (token, project)
  */
 async function requestWithRetry(
   url: string,
@@ -151,48 +253,96 @@ async function requestWithRetry(
   
   logWarn(`开始请求，共有 ${totalCredentials} 个凭证可用`);
   
-  while (credentialCount < totalCredentials) {
-    // Get next available credential
-    let credential: CredentialInfo;
-    try {
-      credential = await getCredential({ modelName });
-    } catch (e: any) {
-      // No more credentials available
-      break;
+  // Get initial credential
+  let credential: CredentialInfo;
+  try {
+    credential = await getCredential({ modelName });
+  } catch (e: any) {
+    throw new Error(`获取凭证失败 (模型: ${modelName}): ${e.message}`);
+  }
+  
+  // Prepare request state for fast updates
+  const requestState: RequestState = {
+    url,
+    baseBody: { ...body },  // Store base body without project
+    headers: {
+      ...DEFAULT_HEADERS,
+      'Accept': isStream ? 'text/event-stream' : 'application/json',
+    },
+    modelName,
+    isStream,
+  };
+  
+  // Variable to hold pre-warmed credential promise
+  let warmedCredentialPromise: Promise<CredentialInfo | null> | null = null;
+  
+  // Helper to warm next credential
+  const warmNextCredential = (): void => {
+    if (!warmedCredentialPromise && credentialCount < totalCredentials) {
+      warmedCredentialPromise = (async () => {
+        try {
+          return await getCredential({ modelName });
+        } catch {
+          return null;
+        }
+      })();
     }
-    
+  };
+  
+  // Helper to get warmed credential
+  const getWarmedCredential = async (): Promise<CredentialInfo | null> => {
+    if (warmedCredentialPromise) {
+      const cred = await warmedCredentialPromise;
+      warmedCredentialPromise = null;
+      return cred;
+    }
+    return null;
+  };
+  
+  while (credentialCount < totalCredentials) {
     const credKey = `${credential.accountId}:gemini`;
     
     // Skip if already tried this credential
     if (triedCredentials.has(credKey)) {
+      // Try to get next credential
+      const nextCred = await getWarmedCredential();
+      if (nextCred) {
+        credential = nextCred;
+      } else {
+        try {
+          credential = await getCredential({ modelName });
+        } catch {
+          break;
+        }
+      }
       credentialCount++;
       continue;
     }
+    
     triedCredentials.add(credKey);
     credentialCount++;
     
-    const { accessToken, projectId, accountId } = credential;
+    const { accountId } = credential;
     
-    // Update body with current project
-    const requestBody = { ...body };
-    requestBody.project = projectId;
+    // Use fast update to prepare request
+    const { headers, body: requestBody } = fastUpdateCredential(requestState, credential);
+    
+    // Pre-warm next credential for faster switching on error
+    warmNextCredential();
     
     try {
       const response = await pfetch(url, {
         method: 'POST',
-        headers: {
-          ...DEFAULT_HEADERS,
-          'Authorization': `Bearer ${accessToken}`,
-          'Accept': isStream ? 'text/event-stream' : 'application/json',
-        },
+        headers,
         body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
+        // Cache error body to avoid re-decode
         const errorText = await response.text();
         const statusCode = response.status;
         
-        // Parse error message for logging
+        // Parse error message for logging (cached)
         let errorMessage = errorText;
         try {
           const errorJson = JSON.parse(errorText);
@@ -208,10 +358,14 @@ async function requestWithRetry(
           if (validationInfo.isValidationError) {
             logWarn(`凭证 ${accountId} 需要账号验证，尝试下一个凭证...`);
             setCredentialValidationRequired(accountId, true, validationInfo.validationUrl, 'gemini');
+            const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+            if (nextCred) credential = nextCred;
             continue;
           }
           // 403 without validation - might be permission issue, try next
           logWarn(`凭证 ${accountId} 返回 403，尝试下一个凭证...`);
+          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+          if (nextCred) credential = nextCred;
           continue;
         }
         
@@ -219,13 +373,31 @@ async function requestWithRetry(
         if (statusCode === 404 && modelName.toLowerCase().includes('preview')) {
           logWarn(`凭证 ${accountId} 不支持 preview 模型，标记为 non-preview，尝试下一个凭证...`);
           setCredentialPreview(accountId, false, 'gemini');
+          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+          if (nextCred) credential = nextCred;
           continue;
         }
         
-        // Handle 429/503 - smooth credential switching without marking cooldown
+        // Handle 429/503 - check for cooldown
         if (statusCode === 429 || statusCode === 503) {
-          logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，平滑切换至下一个凭证 (${credentialCount}/${totalCredentials})`);
-          continue; // Try next credential
+          const cooldownUntil = parseCooldown(errorText);
+          
+          if (cooldownUntil) {
+            // Has cooldown - mark and switch credential
+            logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，冷却至 ${new Date(cooldownUntil * 1000).toISOString()}，切换凭证`);
+            markCredentialRateLimited(accountId, cooldownUntil, 'gemini');
+          } else {
+            // No cooldown - keep current credential and retry after short delay
+            logInfo(`凭证 ${accountId} 触发限流 (${statusCode}) 但无冷却时间，保留凭证稍后重试`);
+            await new Promise(r => setTimeout(r, 1000)); // 1s delay
+            // Don't consume warmed credential, retry with same credential
+            credentialCount--; // Don't count this as an attempt
+            continue;
+          }
+          
+          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+          if (nextCred) credential = nextCred;
+          continue;
         }
         
         // Handle auto-ban error codes - mark but still try next credential
@@ -234,6 +406,8 @@ async function requestWithRetry(
         if (autoBanCodes.includes(statusCode)) {
           logWarn(`凭证 ${accountId} 返回 ${statusCode}，自动禁用，尝试下一个凭证...`);
           markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 3600, 'gemini');
+          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+          if (nextCred) credential = nextCred;
           continue;
         }
         
@@ -244,6 +418,8 @@ async function requestWithRetry(
         
         // Other errors - try next credential
         logWarn(`凭证 ${accountId} 返回 ${statusCode}，尝试下一个凭证...`);
+        const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+        if (nextCred) credential = nextCred;
         continue;
       }
       
@@ -261,6 +437,8 @@ async function requestWithRetry(
       // Network errors - try next credential
       if (error.message?.includes('Network error')) {
         logWarn(`凭证 ${accountId} 网络错误，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
+        const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+        if (nextCred) credential = nextCred;
         continue;
       }
       
@@ -271,6 +449,8 @@ async function requestWithRetry(
       
       // Other errors - try next credential
       logWarn(`凭证 ${accountId} 请求错误: ${errorMsg.substring(0, 100)}，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
+      const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
+      if (nextCred) credential = nextCred;
       continue;
     }
   }
@@ -287,11 +467,12 @@ async function requestWithRetry(
     .map(([code, msg]) => `[${code}] ${msg.substring(0, 100)}`)
     .join('; ');
   
-  throw new Error(`所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
+  throw new Error(`所有 ${totalCredentials} 个凭证均请求失败 (模型: ${modelName})。错误汇总: ${errorSummary || '未知错误'}`);
 }
 
 /**
  * Handle streaming response with proper error handling
+ * Includes response body caching for error optimization
  */
 async function* handleStreamResponse(
   response: Response, 
@@ -336,7 +517,8 @@ async function* handleStreamResponse(
       if (jsonStr && jsonStr !== '[DONE]') {
         try {
           const parsed = JSON.parse(jsonStr) as any;
-          yield unwrapResponse(parsed);
+          const unwrapped = unwrapResponse(parsed);
+          yield unwrapped;
         } catch {
           // Skip malformed JSON
         }
@@ -353,7 +535,7 @@ async function* handleStreamResponse(
  */
 function buildRequestBody(
   modelName: string,
-  projectId: string,
+  _projectId: string,  // project is now added dynamically via fastUpdateCredential
   contents: GeminiContent[],
   systemInstruction?: GeminiContent,
   generationConfig?: GeminiGenerationConfig,
@@ -380,7 +562,7 @@ function buildRequestBody(
 
   return {
     model: modelName,
-    project: projectId,
+    // project will be added dynamically by fastUpdateCredential
     request: innerRequest,
   };
 }

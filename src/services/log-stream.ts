@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 
 export interface LogEntry {
   ts: number;        // timestamp ms
-  level: 'info' | 'warn' | 'error' | 'req';
+  level: 'debug' | 'info' | 'warn' | 'error' | 'req';
   msg: string;
   meta?: Record<string, unknown>;
 }
@@ -16,6 +16,10 @@ function push(entry: LogEntry): void {
   buffer.push(entry);
   if (buffer.length > MAX_BUFFER) buffer.shift();
   emitter.emit('log', entry);
+}
+
+export function logDebug(msg: string, meta?: Record<string, unknown>): void {
+  push({ ts: Date.now(), level: 'debug', msg, meta });
 }
 
 export function logInfo(msg: string, meta?: Record<string, unknown>): void {

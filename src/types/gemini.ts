@@ -56,6 +56,9 @@ export interface GeminiGenerationConfig {
   thinkingConfig?: GeminiThinkingConfig;
   responseModalities?: ('TEXT' | 'IMAGE')[];
   imageConfig?: GeminiImageConfig;
+  seed?: number;
+  responseMimeType?: string;
+  responseSchema?: Record<string, unknown>;
 }
 
 export interface GeminiFunctionDeclaration {
