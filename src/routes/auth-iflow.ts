@@ -101,7 +101,7 @@ export async function exchangeIFlowCode(code: string, state: string): Promise<{ 
       client_id: iflowConfig.clientId,
       client_secret: iflowConfig.clientSecret,
     }),
-  });
+  }, { proxyUrl: undefined });
 
   const tokens = await tokenResponse.json() as any;
 
@@ -112,7 +112,8 @@ export async function exchangeIFlowCode(code: string, state: string): Promise<{ 
   // Fetch user info + API key
   const userInfoResponse = await pfetch(
     `${iflowConfig.userinfoEndpoint}?accessToken=${tokens.access_token}`,
-    { headers: { 'Accept': 'application/json' } }
+    { headers: { 'Accept': 'application/json' } },
+    { proxyUrl: undefined }
   );
 
   const userInfo = await userInfoResponse.json() as any;

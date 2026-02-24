@@ -356,6 +356,8 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
 
   const basicAuth = Buffer.from(`${iflowConfig.clientId}:${iflowConfig.clientSecret}`).toString('base64');
 
+  const cred = await (await import('../storage/credentials.js')).getCredential(accountId);
+  
   const response = await pfetch(iflowConfig.tokenEndpoint, {
     method: 'POST',
     headers: {
@@ -368,7 +370,7 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
       client_id: iflowConfig.clientId,
       client_secret: iflowConfig.clientSecret,
     }),
-  });
+  }, { proxyUrl: cred?.proxy_url || undefined });
 
   const tokens = await response.json() as any;
 
@@ -379,7 +381,8 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
   // Fetch user info to get API key
   const userInfoResponse = await pfetch(
     `${iflowConfig.userinfoEndpoint}?accessToken=${tokens.access_token}`,
-    { headers: { 'Accept': 'application/json' } }
+    { headers: { 'Accept': 'application/json' } },
+    { proxyUrl: cred?.proxy_url || undefined }
   );
 
   const userInfo = await userInfoResponse.json() as any;
