@@ -2,8 +2,10 @@ import { Provider } from '../provider.js';
 import { pfetch } from '../http.js';
 import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getCodexOAuthConfig, getConfig } from '../../config.js';
+import { listCredentials } from '../../storage/credentials.js';
 import { randomUUID } from 'crypto';
 import { countMessagesTokens, estimateTokens } from '../token-counter.js';
+import { logWarn } from '../log-stream.js';
 
 // Codex cache for prompt_cache_key
 interface CodexCache {
@@ -218,501 +220,747 @@ export class CodexProvider implements Provider {
       return this.executeCompact(model, request);
     }
 
-    const cred = await acquireCredential({ requireProject: false, provider: 'codex' });
+    const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
+    const triedCredentials = new Set<string>();
+    let attemptCount = 0;
+    
+    // Get all available Codex credentials
+    const allCredentials = listCredentials().filter(c => c.provider === 'codex');
+    const totalCredentials = allCredentials.length;
+    
+    if (totalCredentials === 0) {
+      throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
+    }
+    
+    // Get initial credential
+    let cred = await acquireCredential({ requireProject: false, provider: 'codex' });
     if (!cred) {
       throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
     }
-
-    const codexConfig = getCodexOAuthConfig();
-    const systemMsg = request.messages?.find((m: any) => m.role === 'system');
     
-    // Build tool name shortening map
-    const originalToolNames: string[] = [];
-    if (request.tools) {
-      for (const t of request.tools) {
-        if (t.type === 'function' && t.function?.name) {
-          originalToolNames.push(t.function.name);
+    // Main retry loop - try all credentials
+    while (attemptCount < totalCredentials && cred) {
+      const credKey = `${cred.account_id}:codex`;
+      
+      // Skip if already tried this credential
+      if (triedCredentials.has(credKey)) {
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
+      }
+      
+      triedCredentials.add(credKey);
+      attemptCount++;
+      
+      const accountId = cred.account_id;
+      
+      // Log which credential is being used
+      if (attemptCount === 1) {
+        logWarn(`[Codex] 使用凭证 [${accountId}] 发起请求 (共 ${totalCredentials} 个凭证可用)`);
+      } else {
+        logWarn(`[Codex] 重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
+      }
+      
+      const codexConfig = getCodexOAuthConfig();
+      const systemMsg = request.messages?.find((m: any) => m.role === 'system');
+      
+      // Build tool name shortening map
+      const originalToolNames: string[] = [];
+      if (request.tools) {
+        for (const t of request.tools) {
+          if (t.type === 'function' && t.function?.name) {
+            originalToolNames.push(t.function.name);
+          }
         }
       }
-    }
-    const shortNameMap = buildShortNameMap(originalToolNames);
-    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
-    
-    const input = convertToResponsesInput(request.messages || [], shortNameMap);
-
-    // Codex API 强制要求 stream: true
-    let body: any = {
-      model,
-      stream: true,
-      input,
-      instructions: systemMsg?.content ?? '',
-      store: false,
-      parallel_tool_calls: true,
-      reasoning: {
-        effort: request.reasoning_effort || 'medium',
-        summary: 'auto',
-      },
-      include: ['reasoning.encrypted_content'],
-    };
-    
-    // Add tools if provided (with shortened names)
-    if (request.tools && request.tools.length > 0) {
-      body.tools = request.tools
-        .filter((t: any) => t.type === 'function')
-        .map((t: any) => {
-          const shortName = shortNameMap.get(t.function.name) || t.function.name;
-          return {
-            type: 'function',
-            name: shortName,
-            description: t.function.description || '',
-            parameters: t.function.parameters || { type: 'object', properties: {} },
-            strict: false,
-          };
-        });
+      const shortNameMap = buildShortNameMap(originalToolNames);
+      const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
       
-      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      const input = convertToResponsesInput(request.messages || [], shortNameMap);
+
+      // Codex API 强制要求 stream: true
+      let body: any = {
+        model,
+        stream: true,
+        input,
+        instructions: systemMsg?.content ?? '',
+        store: false,
+        parallel_tool_calls: true,
+        reasoning: {
+          effort: request.reasoning_effort || 'medium',
+          summary: 'auto',
+        },
+        include: ['reasoning.encrypted_content'],
+      };
       
-      if (body.tools.length === 0) {
-        delete body.tools;
-        delete body.tool_choice;
+      // Add tools if provided (with shortened names)
+      if (request.tools && request.tools.length > 0) {
+        body.tools = request.tools
+          .filter((t: any) => t.type === 'function')
+          .map((t: any) => {
+            const shortName = shortNameMap.get(t.function.name) || t.function.name;
+            return {
+              type: 'function',
+              name: shortName,
+              description: t.function.description || '',
+              parameters: t.function.parameters || { type: 'object', properties: {} },
+              strict: false,
+            };
+          });
+        
+        body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+        
+        if (body.tools.length === 0) {
+          delete body.tools;
+          delete body.tool_choice;
+        }
       }
-    }
 
-    // Apply cache
-    const cacheKey = this.getCacheKey(request, model);
-    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
-    body = finalBody;
+      // Apply cache
+      const cacheKey = this.getCacheKey(request, model);
+      const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+      body = finalBody;
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${cred.access_token}`,
-      'User-Agent': 'codex_cli_rs/0.101.0',
-      'Accept': 'text/event-stream',
-    };
-    
-    if (cacheId) {
-      headers['Conversation_id'] = cacheId;
-      headers['Session_id'] = cacheId;
-    }
-
-    const response = await pfetch(`${codexConfig.apiBase}/responses`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, { proxyUrl: cred.proxy_url || undefined });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred.account_id, retryAfter);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${cred.access_token}`,
+        'User-Agent': 'codex_cli_rs/0.101.0',
+        'Accept': 'text/event-stream',
+      };
+      
+      if (cacheId) {
+        headers['Conversation_id'] = cacheId;
+        headers['Session_id'] = cacheId;
       }
-      const errorText = await response.text();
-      throw new Error(`Codex API 错误 (${response.status}): ${errorText}`);
-    }
 
-    if (!response.body) {
-      throw new Error('Codex 流式响应无数据');
-    }
+      try {
+        const response = await pfetch(`${codexConfig.apiBase}/responses`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        }, { proxyUrl: cred.proxy_url || undefined });
 
-    // 读完整个 SSE 流，从 response.completed 事件提取完整响应
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let currentEvent = '';
-    let completedData: any = null;
-    let reasoningText = '';
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('event: ')) {
-            currentEvent = trimmed.slice(7);
+        if (!response.ok) {
+          const errorText = await response.text();
+          const statusCode = response.status;
+          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          
+          // Handle 429 - wait 1s then try next credential
+          if (statusCode === 429) {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '1', 10);
+            logWarn(`[Codex] 凭证 [${accountId}] 触发限流 (429)，冷却 ${retryAfter}s`);
+            reportRateLimit(accountId, retryAfter);
+            
+            // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+            if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+              cred = nextCred;
+              continue;
+            }
+            break;
+          }
+          
+          // Other errors - try next credential
+          logWarn(`[Codex] 凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+          const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+          if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+            cred = nextCred;
             continue;
           }
-          if (!trimmed.startsWith('data: ')) continue;
-          const jsonStr = trimmed.slice(6);
-          if (jsonStr === '[DONE]') break;
-          try {
-            const event = JSON.parse(jsonStr);
-            if (currentEvent === 'response.completed' || event.type === 'response.completed') {
-              completedData = event.response || event;
-            }
-            // Collect reasoning text
-            if (currentEvent === 'response.reasoning_summary_text.delta' || event.type === 'response.reasoning_summary_text.delta') {
-              reasoningText += event.delta || '';
-            }
-          } catch { /* skip */ }
+          break;
         }
+
+        if (!response.body) {
+          throw new Error('Codex 流式响应无数据');
+        }
+
+        // 读完整个 SSE 流，从 response.completed 事件提取完整响应
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+        let completedData: any = null;
+        let reasoningText = '';
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('event: ')) {
+                currentEvent = trimmed.slice(7);
+                continue;
+              }
+              if (!trimmed.startsWith('data: ')) continue;
+              const jsonStr = trimmed.slice(6);
+              if (jsonStr === '[DONE]') break;
+              try {
+                const event = JSON.parse(jsonStr);
+                if (currentEvent === 'response.completed' || event.type === 'response.completed') {
+                  completedData = event.response || event;
+                }
+                // Collect reasoning text
+                if (currentEvent === 'response.reasoning_summary_text.delta' || event.type === 'response.reasoning_summary_text.delta') {
+                  reasoningText += event.delta || '';
+                }
+              } catch { /* skip */ }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        if (!completedData) {
+          throw new Error('Codex 流未返回 response.completed 事件');
+        }
+
+        return this.responsesApiToOpenAI(model, completedData, reverseMap, reasoningText, request);
+      } catch (error: any) {
+        // If it's already a thrown error from our logic, check if we should continue
+        if (error.message?.includes('[Codex] 所有') || error.message?.includes('切换下一个凭证')) {
+          throw error;
+        }
+        
+        errors.push({ accountId, statusCode: 0, message: error.message });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
-    } finally {
-      reader.releaseLock();
     }
-
-    if (!completedData) {
-      throw new Error('Codex 流未返回 response.completed 事件');
-    }
-
-    return this.responsesApiToOpenAI(model, completedData, reverseMap, reasoningText, request);
+    
+    // All credentials exhausted
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
-    const cred = await acquireCredential({ requireProject: false, provider: 'codex' });
+    const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
+    const triedCredentials = new Set<string>();
+    let attemptCount = 0;
+    
+    // Get all available Codex credentials
+    const allCredentials = listCredentials().filter(c => c.provider === 'codex');
+    const totalCredentials = allCredentials.length;
+    
+    if (totalCredentials === 0) {
+      throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
+    }
+    
+    // Get initial credential
+    let cred = await acquireCredential({ requireProject: false, provider: 'codex' });
     if (!cred) {
       throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
     }
-
-    const codexConfig = getCodexOAuthConfig();
-    const systemMsg = request.messages?.find((m: any) => m.role === 'system');
     
-    // Build tool name shortening map
-    const originalToolNames: string[] = [];
-    if (request.tools) {
-      for (const t of request.tools) {
-        if (t.type === 'function' && t.function?.name) {
-          originalToolNames.push(t.function.name);
+    // Main retry loop - try all credentials
+    while (attemptCount < totalCredentials && cred) {
+      const credKey = `${cred.account_id}:codex`;
+      
+      // Skip if already tried this credential
+      if (triedCredentials.has(credKey)) {
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
         }
+        break;
       }
-    }
-    const shortNameMap = buildShortNameMap(originalToolNames);
-    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
-    
-    const input = convertToResponsesInput(request.messages || [], shortNameMap);
-
-    let body: any = {
-      model,
-      stream: true,
-      input,
-      instructions: systemMsg?.content ?? '',
-      store: false,
-      parallel_tool_calls: true,
-      reasoning: {
-        effort: request.reasoning_effort || 'medium',
-        summary: 'auto',
-      },
-      include: ['reasoning.encrypted_content'],
-    };
-    
-    // Add tools if provided (with shortened names)
-    if (request.tools && request.tools.length > 0) {
-      body.tools = request.tools
-        .filter((t: any) => t.type === 'function')
-        .map((t: any) => {
-          const shortName = shortNameMap.get(t.function.name) || t.function.name;
-          return {
-            type: 'function',
-            name: shortName,
-            description: t.function.description || '',
-            parameters: t.function.parameters || { type: 'object', properties: {} },
-            strict: false,
-          };
-        });
       
-      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      triedCredentials.add(credKey);
+      attemptCount++;
       
-      if (body.tools.length === 0) {
-        delete body.tools;
-        delete body.tool_choice;
+      const accountId = cred.account_id;
+      
+      // Log which credential is being used
+      if (attemptCount === 1) {
+        logWarn(`[Codex] 使用凭证 [${accountId}] 发起流式请求 (共 ${totalCredentials} 个凭证可用)`);
+      } else {
+        logWarn(`[Codex] 重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
       }
-    }
-
-    // Apply cache
-    const cacheKey = this.getCacheKey(request, model);
-    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
-    body = finalBody;
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${cred.access_token}`,
-      'User-Agent': 'codex_cli_rs/0.101.0',
-      'Accept': 'text/event-stream',
-    };
-    
-    if (cacheId) {
-      headers['Conversation_id'] = cacheId;
-      headers['Session_id'] = cacheId;
-    }
-
-    const response = await pfetch(`${codexConfig.apiBase}/responses`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, { proxyUrl: cred.proxy_url || undefined });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred.account_id, retryAfter);
-      }
-      const errorText = await response.text();
-      throw new Error(`Codex API 错误 (${response.status}): ${errorText}`);
-    }
-
-    if (!response.body) {
-      throw new Error('Codex 流式响应无数据');
-    }
-
-    const completionId = generateId();
-    const timestamp = getTimestamp();
-
-    async function* parseStream(): AsyncIterable<any> {
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let currentEvent = '';
-      let hasToolCalls = false;
-      // tool call index tracking removed
-      const toolCallBuffers: Map<number, { id: string; name: string; args: string }> = new Map();
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-
-            if (trimmed.startsWith('event: ')) {
-              currentEvent = trimmed.slice(7);
-              continue;
-            }
-
-            if (!trimmed.startsWith('data: ')) continue;
-
-            const jsonStr = trimmed.slice(6);
-            if (jsonStr === '[DONE]') return;
-
-            try {
-              const event = JSON.parse(jsonStr);
-              const eventType = event.type || currentEvent;
-              
-              if (eventType === 'response.output_text.delta') {
-                const text = event.delta || '';
-                if (text) {
-                  yield {
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: timestamp,
-                    model,
-                    choices: [{
-                      index: 0,
-                      delta: { role: 'assistant', content: text },
-                      finish_reason: null,
-                    }],
-                  };
-                }
-              } else if (eventType === 'response.reasoning_summary_text.delta') {
-                // Yield reasoning content
-                const text = event.delta || '';
-                if (text) {
-                  yield {
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: timestamp,
-                    model,
-                    choices: [{
-                      index: 0,
-                      delta: { role: 'assistant', reasoning_content: text },
-                      finish_reason: null,
-                    }],
-                  };
-                }
-              } else if (eventType === 'response.function_call_arguments.delta') {
-                // Handle function call arguments streaming
-                hasToolCalls = true;
-                const tcIndex = event.item_index || 0;
-                
-                if (!toolCallBuffers.has(tcIndex)) {
-                  toolCallBuffers.set(tcIndex, {
-                    id: event.call_id || `call_${Date.now()}_${tcIndex}`,
-                    name: reverseMap.get(event.name) || event.name || '',
-                    args: '',
-                  });
-                  
-                  // Start new tool call
-                  yield {
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: timestamp,
-                    model,
-                    choices: [{
-                      index: 0,
-                      delta: {
-                        role: 'assistant',
-                        tool_calls: [{
-                          index: tcIndex,
-                          id: toolCallBuffers.get(tcIndex)!.id,
-                          type: 'function',
-                          function: {
-                            name: toolCallBuffers.get(tcIndex)!.name,
-                            arguments: '',
-                          },
-                        }],
-                      },
-                      finish_reason: null,
-                    }],
-                  };
-                }
-                
-                // Append arguments
-                const buf = toolCallBuffers.get(tcIndex)!;
-                if (event.delta) {
-                  buf.args += event.delta;
-                  yield {
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: timestamp,
-                    model,
-                    choices: [{
-                      index: 0,
-                      delta: {
-                        tool_calls: [{
-                          index: tcIndex,
-                          function: {
-                            arguments: event.delta,
-                          },
-                        }],
-                      },
-                      finish_reason: null,
-                    }],
-                  };
-                }
-              } else if (eventType === 'response.output_item.done') {
-                // Function call completed
-                if (event.item?.type === 'function_call') {
-                  hasToolCalls = true;
-                }
-              } else if (eventType === 'response.completed' || eventType === 'response.done') {
-                yield {
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: timestamp,
-                  model,
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
-                  }],
-                };
-              }
-            } catch {
-              // Skip malformed JSON
-            }
+      
+      const codexConfig = getCodexOAuthConfig();
+      const systemMsg = request.messages?.find((m: any) => m.role === 'system');
+      
+      // Build tool name shortening map
+      const originalToolNames: string[] = [];
+      if (request.tools) {
+        for (const t of request.tools) {
+          if (t.type === 'function' && t.function?.name) {
+            originalToolNames.push(t.function.name);
           }
         }
-      } finally {
-        reader.releaseLock();
+      }
+      const shortNameMap = buildShortNameMap(originalToolNames);
+      const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
+      
+      const input = convertToResponsesInput(request.messages || [], shortNameMap);
+
+      let body: any = {
+        model,
+        stream: true,
+        input,
+        instructions: systemMsg?.content ?? '',
+        store: false,
+        parallel_tool_calls: true,
+        reasoning: {
+          effort: request.reasoning_effort || 'medium',
+          summary: 'auto',
+        },
+        include: ['reasoning.encrypted_content'],
+      };
+      
+      // Add tools if provided (with shortened names)
+      if (request.tools && request.tools.length > 0) {
+        body.tools = request.tools
+          .filter((t: any) => t.type === 'function')
+          .map((t: any) => {
+            const shortName = shortNameMap.get(t.function.name) || t.function.name;
+            return {
+              type: 'function',
+              name: shortName,
+              description: t.function.description || '',
+              parameters: t.function.parameters || { type: 'object', properties: {} },
+              strict: false,
+            };
+          });
+        
+        body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+        
+        if (body.tools.length === 0) {
+          delete body.tools;
+          delete body.tool_choice;
+        }
+      }
+
+      // Apply cache
+      const cacheKey = this.getCacheKey(request, model);
+      const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+      body = finalBody;
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${cred.access_token}`,
+        'User-Agent': 'codex_cli_rs/0.101.0',
+        'Accept': 'text/event-stream',
+      };
+      
+      if (cacheId) {
+        headers['Conversation_id'] = cacheId;
+        headers['Session_id'] = cacheId;
+      }
+
+      try {
+        const response = await pfetch(`${codexConfig.apiBase}/responses`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        }, { proxyUrl: cred.proxy_url || undefined });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          const statusCode = response.status;
+          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          
+          // Handle 429 - wait 1s then try next credential
+          if (statusCode === 429) {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '1', 10);
+            logWarn(`[Codex] 凭证 [${accountId}] 触发限流 (429)，冷却 ${retryAfter}s`);
+            reportRateLimit(accountId, retryAfter);
+            
+            // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+            if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+              cred = nextCred;
+              continue;
+            }
+            break;
+          }
+          
+          // Other errors - try next credential
+          logWarn(`[Codex] 凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+          const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+          if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+            cred = nextCred;
+            continue;
+          }
+          break;
+        }
+
+        if (!response.body) {
+          throw new Error('Codex 流式响应无数据');
+        }
+
+        const completionId = generateId();
+        const timestamp = getTimestamp();
+
+        async function* parseStream(): AsyncIterable<any> {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let currentEvent = '';
+          let hasToolCalls = false;
+          const toolCallBuffers: Map<number, { id: string; name: string; args: string }> = new Map();
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+
+                if (trimmed.startsWith('event: ')) {
+                  currentEvent = trimmed.slice(7);
+                  continue;
+                }
+
+                if (!trimmed.startsWith('data: ')) continue;
+
+                const jsonStr = trimmed.slice(6);
+                if (jsonStr === '[DONE]') return;
+
+                try {
+                  const event = JSON.parse(jsonStr);
+                  const eventType = event.type || currentEvent;
+                  
+                  if (eventType === 'response.output_text.delta') {
+                    const text = event.delta || '';
+                    if (text) {
+                      yield {
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: timestamp,
+                        model,
+                        choices: [{
+                          index: 0,
+                          delta: { role: 'assistant', content: text },
+                          finish_reason: null,
+                        }],
+                      };
+                    }
+                  } else if (eventType === 'response.reasoning_summary_text.delta') {
+                    // Yield reasoning content
+                    const text = event.delta || '';
+                    if (text) {
+                      yield {
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: timestamp,
+                        model,
+                        choices: [{
+                          index: 0,
+                          delta: { role: 'assistant', reasoning_content: text },
+                          finish_reason: null,
+                        }],
+                      };
+                    }
+                  } else if (eventType === 'response.function_call_arguments.delta') {
+                    // Handle function call arguments streaming
+                    hasToolCalls = true;
+                    const tcIndex = event.item_index || 0;
+                    
+                    if (!toolCallBuffers.has(tcIndex)) {
+                      toolCallBuffers.set(tcIndex, {
+                        id: event.call_id || `call_${Date.now()}_${tcIndex}`,
+                        name: reverseMap.get(event.name) || event.name || '',
+                        args: '',
+                      });
+                      
+                      // Start new tool call
+                      yield {
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: timestamp,
+                        model,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            role: 'assistant',
+                            tool_calls: [{
+                              index: tcIndex,
+                              id: toolCallBuffers.get(tcIndex)!.id,
+                              type: 'function',
+                              function: {
+                                name: toolCallBuffers.get(tcIndex)!.name,
+                                arguments: '',
+                              },
+                            }],
+                          },
+                          finish_reason: null,
+                        }],
+                      };
+                    }
+                    
+                    // Append arguments
+                    const buf = toolCallBuffers.get(tcIndex)!;
+                    if (event.delta) {
+                      buf.args += event.delta;
+                      yield {
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: timestamp,
+                        model,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: tcIndex,
+                              function: {
+                                arguments: event.delta,
+                              },
+                            }],
+                          },
+                          finish_reason: null,
+                        }],
+                      };
+                    }
+                  } else if (eventType === 'response.output_item.done') {
+                    // Function call completed
+                    if (event.item?.type === 'function_call') {
+                      hasToolCalls = true;
+                    }
+                  } else if (eventType === 'response.completed' || eventType === 'response.done') {
+                    yield {
+                      id: completionId,
+                      object: 'chat.completion.chunk',
+                      created: timestamp,
+                      model,
+                      choices: [{
+                        index: 0,
+                        delta: {},
+                        finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
+                      }],
+                    };
+                  }
+                } catch {
+                  // Skip malformed JSON
+                }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+          }
+        }
+
+        return parseStream();
+      } catch (error: any) {
+        // If it's already a thrown error from our logic, check if we should continue
+        if (error.message?.includes('[Codex] 所有') || error.message?.includes('切换下一个凭证')) {
+          throw error;
+        }
+        
+        errors.push({ accountId, statusCode: 0, message: error.message });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
     }
-
-    return parseStream();
+    
+    // All credentials exhausted
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   /**
    * Execute compact request (non-streaming, for /responses/compact)
    */
   private async executeCompact(model: string, request: any): Promise<any> {
-    const cred = await acquireCredential({ requireProject: false, provider: 'codex' });
+    const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
+    const triedCredentials = new Set<string>();
+    let attemptCount = 0;
+    
+    // Get all available Codex credentials
+    const allCredentials = listCredentials().filter(c => c.provider === 'codex');
+    const totalCredentials = allCredentials.length;
+    
+    if (totalCredentials === 0) {
+      throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
+    }
+    
+    // Get initial credential
+    let cred = await acquireCredential({ requireProject: false, provider: 'codex' });
     if (!cred) {
       throw new Error('未登录 Codex，请先通过 /auth/codex/login 认证');
     }
-
-    const codexConfig = getCodexOAuthConfig();
     
-    // Build tool name shortening map
-    const originalToolNames: string[] = [];
-    if (request.tools) {
-      for (const t of request.tools) {
-        if (t.type === 'function' && t.function?.name) {
-          originalToolNames.push(t.function.name);
+    // Main retry loop - try all credentials
+    while (attemptCount < totalCredentials && cred) {
+      const credKey = `${cred.account_id}:codex`;
+      
+      // Skip if already tried this credential
+      if (triedCredentials.has(credKey)) {
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
+      }
+      
+      triedCredentials.add(credKey);
+      attemptCount++;
+      
+      const accountId = cred.account_id;
+      
+      // Log which credential is being used
+      if (attemptCount === 1) {
+        logWarn(`[Codex] 使用凭证 [${accountId}] 发起 compact 请求 (共 ${totalCredentials} 个凭证可用)`);
+      } else {
+        logWarn(`[Codex] 重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
+      }
+      
+      const codexConfig = getCodexOAuthConfig();
+      
+      // Build tool name shortening map
+      const originalToolNames: string[] = [];
+      if (request.tools) {
+        for (const t of request.tools) {
+          if (t.type === 'function' && t.function?.name) {
+            originalToolNames.push(t.function.name);
+          }
         }
       }
-    }
-    const shortNameMap = buildShortNameMap(originalToolNames);
-    const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
-    
-    const input = convertToResponsesInput(request.messages || [], shortNameMap);
+      const shortNameMap = buildShortNameMap(originalToolNames);
+      const reverseMap = new Map([...shortNameMap].map(([k, v]) => [v, k]));
+      
+      const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
-    let body: any = {
-      model,
-      input,
-      instructions: request.messages?.find((m: any) => m.role === 'system')?.content ?? '',
-      store: false,
-      parallel_tool_calls: true,
-      reasoning: {
-        effort: request.reasoning_effort || 'medium',
-        summary: 'auto',
-      },
-    };
-    
-    // Add tools if provided
-    if (request.tools && request.tools.length > 0) {
-      body.tools = request.tools
-        .filter((t: any) => t.type === 'function')
-        .map((t: any) => {
-          const shortName = shortNameMap.get(t.function.name) || t.function.name;
-          return {
-            type: 'function',
-            name: shortName,
-            description: t.function.description || '',
-            parameters: t.function.parameters || { type: 'object', properties: {} },
-            strict: false,
-          };
-        });
+      let body: any = {
+        model,
+        input,
+        instructions: request.messages?.find((m: any) => m.role === 'system')?.content ?? '',
+        store: false,
+        parallel_tool_calls: true,
+        reasoning: {
+          effort: request.reasoning_effort || 'medium',
+          summary: 'auto',
+        },
+      };
       
-      body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+      // Add tools if provided
+      if (request.tools && request.tools.length > 0) {
+        body.tools = request.tools
+          .filter((t: any) => t.type === 'function')
+          .map((t: any) => {
+            const shortName = shortNameMap.get(t.function.name) || t.function.name;
+            return {
+              type: 'function',
+              name: shortName,
+              description: t.function.description || '',
+              parameters: t.function.parameters || { type: 'object', properties: {} },
+              strict: false,
+            };
+          });
+        
+        body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
+        
+        if (body.tools.length === 0) {
+          delete body.tools;
+          delete body.tool_choice;
+        }
+      }
+
+      // Apply cache
+      const cacheKey = this.getCacheKey(request, model);
+      const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
+      body = finalBody;
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${cred.access_token}`,
+        'User-Agent': 'codex_cli_rs/0.101.0',
+        'Accept': 'application/json',
+      };
       
-      if (body.tools.length === 0) {
-        delete body.tools;
-        delete body.tool_choice;
+      if (cacheId) {
+        headers['Conversation_id'] = cacheId;
+        headers['Session_id'] = cacheId;
+      }
+
+      try {
+        const response = await pfetch(`${codexConfig.apiBase}/responses/compact`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        }, { proxyUrl: cred.proxy_url || undefined });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          const statusCode = response.status;
+          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          
+          // Handle 429 - wait 1s then try next credential
+          if (statusCode === 429) {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '1', 10);
+            logWarn(`[Codex] 凭证 [${accountId}] 触发限流 (429)，冷却 ${retryAfter}s`);
+            reportRateLimit(accountId, retryAfter);
+            
+            // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+            if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+              cred = nextCred;
+              continue;
+            }
+            break;
+          }
+          
+          // Other errors - try next credential
+          logWarn(`[Codex] 凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+          const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+          if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+            cred = nextCred;
+            continue;
+          }
+          break;
+        }
+
+        const data = await response.json();
+        return this.responsesApiToOpenAI(model, data, reverseMap, undefined, request);
+      } catch (error: any) {
+        errors.push({ accountId, statusCode: 0, message: error.message });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
+        if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
     }
-
-    // Apply cache
-    const cacheKey = this.getCacheKey(request, model);
-    const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
-    body = finalBody;
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${cred.access_token}`,
-      'User-Agent': 'codex_cli_rs/0.101.0',
-      'Accept': 'application/json',
-    };
     
-    if (cacheId) {
-      headers['Conversation_id'] = cacheId;
-      headers['Session_id'] = cacheId;
-    }
-
-    const response = await pfetch(`${codexConfig.apiBase}/responses/compact`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, { proxyUrl: cred.proxy_url || undefined });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred.account_id, retryAfter);
-      }
-      const errorText = await response.text();
-      throw new Error(`Codex API 错误 (${response.status}): ${errorText}`);
-    }
-
-    const data = await response.json();
-    return this.responsesApiToOpenAI(model, data, reverseMap, undefined, request);
+    // All credentials exhausted
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   isModelSupported(model: string): boolean {

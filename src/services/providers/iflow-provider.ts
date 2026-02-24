@@ -4,7 +4,7 @@ import { Provider } from '../provider.js';
 import { pfetch } from '../http.js';
 import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getIFlowOAuthConfig, getConfig } from '../../config.js';
-import { getCredential as getStoredCredential, saveCredential } from '../../storage/credentials.js';
+import { getCredential as getStoredCredential, saveCredential, listCredentials } from '../../storage/credentials.js';
 import { logWarn, logInfo } from '../log-stream.js';
 import { calculateRequestTokens, countMessagesTokens } from '../token-counter.js';
 
@@ -216,205 +216,364 @@ export class IFlowProvider implements Provider {
   }
 
   async chatCompletion(model: string, request: any): Promise<any> {
+    const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
+    const triedCredentials = new Set<string>();
+    let attemptCount = 0;
+    
+    // Get all available iFlow credentials
+    const allCredentials = listCredentials().filter(c => c.provider === 'iflow');
+    const totalCredentials = allCredentials.length;
+    
+    if (totalCredentials === 0) {
+      throw new Error('未登录 iFlow，请先通过 /auth/iflow/login 认证');
+    }
+    
+    // Get initial credential
     let cred = await acquireCredential({ requireProject: false, provider: 'iflow' });
     if (!cred) {
       throw new Error('未登录 iFlow，请先通过 /auth/iflow/login 认证');
     }
-
-    // Refresh credentials if needed
-    cred = await this.refreshIfNeeded(cred);
-
-    const iflowConfig = getIFlowOAuthConfig();
-    // iFlow stores the API key in access_token after OAuth flow
-    const apiKey = cred!.access_token;
-    const sessionId = `session-${randomUUID()}`;
-    const ts = Date.now();
-    const signature = createSignature(apiKey, sessionId, ts);
-
-    // Preserve reasoning content for multi-turn conversations
-    const messages = preserveReasoningContent(request.messages);
-
-    let body: any = {
-      model,
-      messages,
-      stream: false,
-    };
-    if (request.temperature !== undefined) body.temperature = request.temperature;
-    if (request.top_p !== undefined) body.top_p = request.top_p;
-    if (request.max_tokens !== undefined) body.max_tokens = request.max_tokens;
-    if (request.tools) body.tools = request.tools;
-    if (request.tool_choice) body.tool_choice = request.tool_choice;
     
-    // Ensure tools array is not empty
-    body = ensureToolsArray(body);
-
-    const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'iFlow-Cli',
-        'session-id': sessionId,
-        'x-iflow-timestamp': String(ts),
-        'x-iflow-signature': signature,
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify(body),
-    }, { proxyUrl: cred!.proxy_url || undefined });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred!.account_id, retryAfter);
+    // Main retry loop - try all credentials
+    while (attemptCount < totalCredentials && cred) {
+      const credKey = `${cred.account_id}:iflow`;
+      
+      // Skip if already tried this credential
+      if (triedCredentials.has(credKey)) {
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+        if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
-      const errorText = await response.text();
-      throw new Error(`iFlow API 错误 (${response.status}): ${errorText}`);
-    }
-
-    // iFlow returns standard OpenAI format, passthrough
-    const result = await response.json() as any;
-    
-    // Ensure usage is present (estimate if missing)
-    if (!result.usage) {
-      const estimated = calculateRequestTokens(request);
-      result.usage = {
-        prompt_tokens: estimated.prompt_tokens,
-        completion_tokens: estimated.completion_tokens,
-        total_tokens: estimated.total_tokens,
-        estimated: true,
+      
+      triedCredentials.add(credKey);
+      attemptCount++;
+      
+      const accountId = cred.account_id;
+      
+      // Log which credential is being used
+      if (attemptCount === 1) {
+        logWarn(`[iFlow] 使用凭证 [${accountId}] 发起请求 (共 ${totalCredentials} 个凭证可用)`);
+      } else {
+        logWarn(`[iFlow] 重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
+      }
+      
+      // Refresh credentials if needed
+      cred = await this.refreshIfNeeded(cred);
+      if (!cred) break;
+      
+      const iflowConfig = getIFlowOAuthConfig();
+      const apiKey = cred.access_token;
+      const sessionId = `session-${randomUUID()}`;
+      const ts = Date.now();
+      const signature = createSignature(apiKey, sessionId, ts);
+      
+      // Preserve reasoning content for multi-turn conversations
+      const messages = preserveReasoningContent(request.messages);
+      
+      let body: any = {
+        model,
+        messages,
+        stream: false,
       };
+      if (request.temperature !== undefined) body.temperature = request.temperature;
+      if (request.top_p !== undefined) body.top_p = request.top_p;
+      if (request.max_tokens !== undefined) body.max_tokens = request.max_tokens;
+      if (request.tools) body.tools = request.tools;
+      if (request.tool_choice) body.tool_choice = request.tool_choice;
+      
+      // Ensure tools array is not empty
+      body = ensureToolsArray(body);
+      
+      try {
+        const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'User-Agent': 'iFlow-Cli',
+            'session-id': sessionId,
+            'x-iflow-timestamp': String(ts),
+            'x-iflow-signature': signature,
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(body),
+        }, { proxyUrl: cred.proxy_url || undefined });
+        
+        if (!response.ok) {
+          const errorText = await response.text();
+          const statusCode = response.status;
+          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          
+          // Handle 429 - wait 1s then try next credential
+          if (statusCode === 429) {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '1', 10);
+            logWarn(`[iFlow] 凭证 [${accountId}] 触发限流 (429)，冷却 ${retryAfter}s`);
+            reportRateLimit(accountId, retryAfter);
+            
+            // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+            if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+              cred = nextCred;
+              continue;
+            }
+            break;
+          }
+          
+          // Other errors - try next credential
+          logWarn(`[iFlow] 凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+          const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+          if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+            cred = nextCred;
+            continue;
+          }
+          break;
+        }
+        
+        // iFlow returns standard OpenAI format, passthrough
+        const result = await response.json() as any;
+        
+        // Ensure usage is present (estimate if missing)
+        if (!result.usage) {
+          const estimated = calculateRequestTokens(request);
+          result.usage = {
+            prompt_tokens: estimated.prompt_tokens,
+            completion_tokens: estimated.completion_tokens,
+            total_tokens: estimated.total_tokens,
+            estimated: true,
+          };
+        }
+        
+        return result;
+      } catch (error: any) {
+        errors.push({ accountId, statusCode: 0, message: error.message });
+        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+        if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
+      }
     }
     
-    return result;
+    // All credentials exhausted
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    throw new Error(`[iFlow] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
+    const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
+    const triedCredentials = new Set<string>();
+    let attemptCount = 0;
+    
+    // Get all available iFlow credentials
+    const allCredentials = listCredentials().filter(c => c.provider === 'iflow');
+    const totalCredentials = allCredentials.length;
+    
+    if (totalCredentials === 0) {
+      throw new Error('未登录 iFlow，请先通过 /auth/iflow/login 认证');
+    }
+    
+    // Get initial credential
     let cred = await acquireCredential({ requireProject: false, provider: 'iflow' });
     if (!cred) {
       throw new Error('未登录 iFlow，请先通过 /auth/iflow/login 认证');
     }
-
-    // Refresh credentials if needed
-    cred = await this.refreshIfNeeded(cred);
-
-    const iflowConfig = getIFlowOAuthConfig();
-    const apiKey = cred!.access_token;
-    const sessionId = `session-${randomUUID()}`;
-    const ts = Date.now();
-    const signature = createSignature(apiKey, sessionId, ts);
-
-    // Preserve reasoning content for multi-turn conversations
-    const messages = preserveReasoningContent(request.messages);
     
-    // Calculate estimated tokens for usage tracking
-    const estimatedTokens = countMessagesTokens(messages);
-
-    let body: any = {
-      model,
-      messages,
-      stream: true,
-    };
-    if (request.temperature !== undefined) body.temperature = request.temperature;
-    if (request.top_p !== undefined) body.top_p = request.top_p;
-    if (request.max_tokens !== undefined) body.max_tokens = request.max_tokens;
-    if (request.tools) body.tools = request.tools;
-    if (request.tool_choice) body.tool_choice = request.tool_choice;
-    
-    // Ensure tools array is not empty
-    body = ensureToolsArray(body);
-
-    const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'iFlow-Cli',
-        'session-id': sessionId,
-        'x-iflow-timestamp': String(ts),
-        'x-iflow-signature': signature,
-        'Accept': 'text/event-stream',
-      },
-      body: JSON.stringify(body),
-    }, { proxyUrl: cred!.proxy_url || undefined });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred!.account_id, retryAfter);
+    // Main retry loop - try all credentials
+    while (attemptCount < totalCredentials && cred) {
+      const credKey = `${cred.account_id}:iflow`;
+      
+      // Skip if already tried this credential
+      if (triedCredentials.has(credKey)) {
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+        if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
-      const errorText = await response.text();
-      throw new Error(`iFlow API 错误 (${response.status}): ${errorText}`);
-    }
-
-    if (!response.body) {
-      throw new Error('iFlow 流式响应无数据');
-    }
-
-    // iFlow returns standard OpenAI SSE format, passthrough
-    async function* parseStream(): AsyncIterable<any> {
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let hasUsage = false;
-      let completionTokens = 0;
-
+      
+      triedCredentials.add(credKey);
+      attemptCount++;
+      
+      const accountId = cred.account_id;
+      
+      // Log which credential is being used
+      if (attemptCount === 1) {
+        logWarn(`[iFlow] 使用凭证 [${accountId}] 发起流式请求 (共 ${totalCredentials} 个凭证可用)`);
+      } else {
+        logWarn(`[iFlow] 重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
+      }
+      
+      // Refresh credentials if needed
+      cred = await this.refreshIfNeeded(cred);
+      if (!cred) break;
+      
+      const iflowConfig = getIFlowOAuthConfig();
+      const apiKey = cred.access_token;
+      const sessionId = `session-${randomUUID()}`;
+      const ts = Date.now();
+      const signature = createSignature(apiKey, sessionId, ts);
+      
+      // Preserve reasoning content for multi-turn conversations
+      const messages = preserveReasoningContent(request.messages);
+      
+      // Calculate estimated tokens for usage tracking
+      const estimatedTokens = countMessagesTokens(messages);
+      
+      let body: any = {
+        model,
+        messages,
+        stream: true,
+      };
+      if (request.temperature !== undefined) body.temperature = request.temperature;
+      if (request.top_p !== undefined) body.top_p = request.top_p;
+      if (request.max_tokens !== undefined) body.max_tokens = request.max_tokens;
+      if (request.tools) body.tools = request.tools;
+      if (request.tool_choice) body.tool_choice = request.tool_choice;
+      
+      // Ensure tools array is not empty
+      body = ensureToolsArray(body);
+      
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const jsonStr = trimmed.slice(6);
-            if (jsonStr === '[DONE]') {
-              // If no usage was received, yield an estimated usage chunk
-              if (!hasUsage) {
-                yield {
-                  id: `chatcmpl-${Date.now()}`,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model,
-                  usage: {
-                    prompt_tokens: estimatedTokens,
-                    completion_tokens: completionTokens,
-                    total_tokens: estimatedTokens + completionTokens,
-                    estimated: true,
-                  },
-                };
-              }
-              return;
+        const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'User-Agent': 'iFlow-Cli',
+            'session-id': sessionId,
+            'x-iflow-timestamp': String(ts),
+            'x-iflow-signature': signature,
+            'Accept': 'text/event-stream',
+          },
+          body: JSON.stringify(body),
+        }, { proxyUrl: cred.proxy_url || undefined });
+        
+        if (!response.ok) {
+          const errorText = await response.text();
+          const statusCode = response.status;
+          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          
+          // Handle 429 - wait 1s then try next credential
+          if (statusCode === 429) {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '1', 10);
+            logWarn(`[iFlow] 凭证 [${accountId}] 触发限流 (429)，冷却 ${retryAfter}s`);
+            reportRateLimit(accountId, retryAfter);
+            
+            // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+            if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+              cred = nextCred;
+              continue;
             }
-
-            try {
-              const chunk = JSON.parse(jsonStr);
+            break;
+          }
+          
+          // Other errors - try next credential
+          logWarn(`[iFlow] 凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+          const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+          if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+            cred = nextCred;
+            continue;
+          }
+          break;
+        }
+        
+        if (!response.body) {
+          throw new Error('iFlow 流式响应无数据');
+        }
+        
+        // iFlow returns standard OpenAI SSE format, passthrough
+        async function* parseStream(): AsyncIterable<any> {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let hasUsage = false;
+          let completionTokens = 0;
+          
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
               
-              // Track if we received usage from upstream
-              if (chunk.usage) {
-                hasUsage = true;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+              
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data: ')) continue;
+                const jsonStr = trimmed.slice(6);
+                if (jsonStr === '[DONE]') {
+                  // If no usage was received, yield an estimated usage chunk
+                  if (!hasUsage) {
+                    yield {
+                      id: `chatcmpl-${Date.now()}`,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model,
+                      usage: {
+                        prompt_tokens: estimatedTokens,
+                        completion_tokens: completionTokens,
+                        total_tokens: estimatedTokens + completionTokens,
+                        estimated: true,
+                      },
+                    };
+                  }
+                  return;
+                }
+                
+                try {
+                  const chunk = JSON.parse(jsonStr);
+                  
+                  // Track if we received usage from upstream
+                  if (chunk.usage) {
+                    hasUsage = true;
+                  }
+                  
+                  // Track completion tokens for estimation
+                  if (chunk.choices?.[0]?.delta?.content) {
+                    completionTokens += Math.ceil(chunk.choices[0].delta.content.length / 4);
+                  }
+                  
+                  yield chunk;
+                } catch {
+                  // Skip malformed JSON
+                }
               }
-              
-              // Track completion tokens for estimation
-              if (chunk.choices?.[0]?.delta?.content) {
-                completionTokens += Math.ceil(chunk.choices[0].delta.content.length / 4);
-              }
-              
-              yield chunk;
-            } catch {
-              // Skip malformed JSON
             }
+          } finally {
+            reader.releaseLock();
           }
         }
-      } finally {
-        reader.releaseLock();
+        
+        return parseStream();
+      } catch (error: any) {
+        errors.push({ accountId, statusCode: 0, message: error.message });
+        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        
+        const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
+        if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
+          cred = nextCred;
+          continue;
+        }
+        break;
       }
     }
-
-    return parseStream();
+    
+    // All credentials exhausted
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    throw new Error(`[iFlow] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   isModelSupported(model: string): boolean {

@@ -13,7 +13,7 @@ import {
   markCredentialRateLimited,
   listCredentials,
 } from '../storage/credentials.js';
-import { logWarn, logInfo } from './log-stream.js';
+import { logWarn } from './log-stream.js';
 
 const SAFETY_SETTINGS = [
   { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
@@ -261,9 +261,10 @@ function fastUpdateCredential(
  * 
  * Optimizations:
  * 1. Credential warming: Pre-fetch next credential asynchronously
- * 2. 429 without cooldown: Retry with same credential
+ * 2. 429 without cooldown: Wait 1s then retry with next credential
  * 3. Response caching: Cache error body to avoid re-decode
  * 4. Fast updates: Only update changed fields (token, project)
+ * 5. Concurrent request isolation: Each request maintains its own credential state
  */
 async function requestWithRetry(
   url: string,
@@ -271,11 +272,12 @@ async function requestWithRetry(
   modelName: string,
   isStream: boolean = false
 ): Promise<Response | AsyncIterable<any>> {
+  // Each concurrent request has its own state
   const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
   const triedCredentials = new Set<string>();
-  let credentialCount = 0;
+  let attemptCount = 0;
   
-  // Get all available gemini credentials
+  // Get all available gemini credentials for this request
   const allCredentials = listCredentials().filter(c => c.provider === 'gemini' || !c.provider);
   const totalCredentials = allCredentials.length;
   
@@ -283,9 +285,7 @@ async function requestWithRetry(
     throw new Error('没有可用的 Gemini 凭证，请检查认证状态');
   }
   
-  logWarn(`开始请求，共有 ${totalCredentials} 个凭证可用`);
-  
-  // Get initial credential
+  // Get initial credential for this request
   let credential: CredentialInfo;
   try {
     credential = await getCredential({ modelName });
@@ -293,7 +293,7 @@ async function requestWithRetry(
     throw new Error(`获取凭证失败 (模型: ${modelName}): ${e.message}`);
   }
   
-  // Prepare request state for fast updates
+  // Prepare request state for fast updates (isolated per request)
   const requestState: RequestState = {
     url,
     baseBody: { ...body },  // Store base body without project
@@ -305,12 +305,12 @@ async function requestWithRetry(
     isStream,
   };
   
-  // Variable to hold pre-warmed credential promise
+  // Variable to hold pre-warmed credential promise (isolated per request)
   let warmedCredentialPromise: Promise<CredentialInfo | null> | null = null;
   
   // Helper to warm next credential
   const warmNextCredential = (): void => {
-    if (!warmedCredentialPromise && credentialCount < totalCredentials) {
+    if (!warmedCredentialPromise) {
       warmedCredentialPromise = (async () => {
         try {
           return await getCredential({ modelName });
@@ -331,30 +331,43 @@ async function requestWithRetry(
     return null;
   };
   
-  while (credentialCount < totalCredentials) {
+  // Helper to get next credential (with fallback)
+  const getNextCredentialAsync = async (): Promise<CredentialInfo | null> => {
+    const warmed = await getWarmedCredential();
+    if (warmed) return warmed;
+    try {
+      return await getCredential({ modelName });
+    } catch {
+      return null;
+    }
+  };
+  
+  // Main retry loop - try all credentials
+  while (attemptCount < totalCredentials) {
     const credKey = `${credential.accountId}:gemini`;
     
-    // Skip if already tried this credential
+    // Skip if already tried this credential (but allow same credential for 429 retry)
     if (triedCredentials.has(credKey)) {
-      // Try to get next credential
-      const nextCred = await getWarmedCredential();
-      if (nextCred) {
+      const nextCred = await getNextCredentialAsync();
+      if (nextCred && `${nextCred.accountId}:gemini` !== credKey) {
         credential = nextCred;
-      } else {
-        try {
-          credential = await getCredential({ modelName });
-        } catch {
-          break;
-        }
+        continue;
       }
-      credentialCount++;
-      continue;
+      // No more unique credentials
+      break;
     }
     
     triedCredentials.add(credKey);
-    credentialCount++;
+    attemptCount++;
     
     const { accountId } = credential;
+    
+    // Log which credential is being used for this request
+    if (attemptCount === 1) {
+      logWarn(`使用凭证 [${accountId}] 发起请求 (共 ${totalCredentials} 个凭证可用)`);
+    } else {
+      logWarn(`重试 #${attemptCount}: 切换到凭证 [${accountId}]`);
+    }
     
     // Use fast update to prepare request
     const { headers, body: requestBody } = fastUpdateCredential(requestState, credential);
@@ -388,59 +401,75 @@ async function requestWithRetry(
         if (statusCode === 403) {
           const validationInfo = parseValidationError(errorText);
           if (validationInfo.isValidationError) {
-            logWarn(`凭证 ${accountId} 需要账号验证，尝试下一个凭证...`);
+            logWarn(`凭证 [${accountId}] 需要账号验证，切换下一个凭证...`);
             setCredentialValidationRequired(accountId, true, validationInfo.validationUrl, 'gemini');
-            const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-            if (nextCred) credential = nextCred;
-            continue;
+            const nextCred = await getNextCredentialAsync();
+            if (nextCred) {
+              credential = nextCred;
+              continue;
+            }
+            break;
           }
           // 403 without validation - might be permission issue, try next
-          logWarn(`凭证 ${accountId} 返回 403，尝试下一个凭证...`);
-          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-          if (nextCred) credential = nextCred;
-          continue;
+          logWarn(`凭证 [${accountId}] 返回 403，切换下一个凭证...`);
+          const nextCred = await getNextCredentialAsync();
+          if (nextCred) {
+            credential = nextCred;
+            continue;
+          }
+          break;
         }
         
         // Handle 404 preview model error - mark and try next credential
         if (statusCode === 404 && modelName.toLowerCase().includes('preview')) {
-          logWarn(`凭证 ${accountId} 不支持 preview 模型，标记为 non-preview，尝试下一个凭证...`);
+          logWarn(`凭证 [${accountId}] 不支持 preview 模型，切换下一个凭证...`);
           setCredentialPreview(accountId, false, 'gemini');
-          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-          if (nextCred) credential = nextCred;
-          continue;
+          const nextCred = await getNextCredentialAsync();
+          if (nextCred) {
+            credential = nextCred;
+            continue;
+          }
+          break;
         }
         
-        // Handle 429/503 - check for cooldown
+        // Handle 429/503 - wait 1s then try next credential
         if (statusCode === 429 || statusCode === 503) {
           const cooldownUntil = parseCooldown(errorText);
           
           if (cooldownUntil) {
-            // Has cooldown - mark and switch credential
-            logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，冷却至 ${new Date(cooldownUntil * 1000).toISOString()}，切换凭证`);
+            // Has cooldown - mark credential and switch
+            logWarn(`凭证 [${accountId}] 触发限流 (${statusCode})，冷却至 ${new Date(cooldownUntil * 1000).toISOString()}`);
             markCredentialRateLimited(accountId, cooldownUntil, 'gemini');
           } else {
-            // No cooldown - keep current credential and retry after short delay
-            logInfo(`凭证 ${accountId} 触发限流 (${statusCode}) 但无冷却时间，保留凭证稍后重试`);
-            await new Promise(r => setTimeout(r, 1000)); // 1s delay
-            // Don't consume warmed credential, retry with same credential
-            credentialCount--; // Don't count this as an attempt
-            continue;
+            // No cooldown info - use short 1s rate-limit
+            logWarn(`凭证 [${accountId}] 触发限流 (${statusCode})，标记 1s 冷却`);
+            markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 1, 'gemini');
           }
           
-          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-          if (nextCred) credential = nextCred;
-          continue;
+          // Wait 1s before retry
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // Get next credential for retry
+          const nextCred = await getNextCredentialAsync();
+          if (nextCred) {
+            credential = nextCred;
+            continue;
+          }
+          break;
         }
         
         // Handle auto-ban error codes - mark but still try next credential
         const config = getConfig();
-        const autoBanCodes = config.gemini.autoBanErrorCodes || [403];
+        const autoBanCodes = config.gemini.autoBanErrorCodes || [];
         if (autoBanCodes.includes(statusCode)) {
-          logWarn(`凭证 ${accountId} 返回 ${statusCode}，自动禁用，尝试下一个凭证...`);
+          logWarn(`凭证 [${accountId}] 返回 ${statusCode}，自动禁用，切换下一个凭证...`);
           markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 3600, 'gemini');
-          const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-          if (nextCred) credential = nextCred;
-          continue;
+          const nextCred = await getNextCredentialAsync();
+          if (nextCred) {
+            credential = nextCred;
+            continue;
+          }
+          break;
         }
         
         // Check if fatal error (should not retry)
@@ -449,10 +478,13 @@ async function requestWithRetry(
         }
         
         // Other errors - try next credential
-        logWarn(`凭证 ${accountId} 返回 ${statusCode}，尝试下一个凭证...`);
-        const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-        if (nextCred) credential = nextCred;
-        continue;
+        logWarn(`凭证 [${accountId}] 返回 ${statusCode}，切换下一个凭证...`);
+        const nextCred = await getNextCredentialAsync();
+        if (nextCred) {
+          credential = nextCred;
+          continue;
+        }
+        break;
       }
       
       // Success - return response
@@ -466,24 +498,19 @@ async function requestWithRetry(
       const errorMsg = error.message || '未知错误';
       errors.push({ accountId, statusCode: 0, message: errorMsg.substring(0, 200) });
       
-      // Network errors - try next credential
-      if (error.message?.includes('Network error')) {
-        logWarn(`凭证 ${accountId} 网络错误，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
-        const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-        if (nextCred) credential = nextCred;
-        continue;
-      }
-      
       // If it's a thrown error from above (non-retryable), re-throw
       if (error.message?.includes('Gemini API 错误') && isFatalError(parseInt(error.message.match(/\((\d+)\)/)?.[1] || '0'))) {
         throw error;
       }
       
-      // Other errors - try next credential
-      logWarn(`凭证 ${accountId} 请求错误: ${errorMsg.substring(0, 100)}，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
-      const nextCred = await getWarmedCredential() || await getCredential({ modelName }).catch(() => null);
-      if (nextCred) credential = nextCred;
-      continue;
+      // Network or other errors - try next credential
+      logWarn(`凭证 [${accountId}] 请求错误: ${errorMsg.substring(0, 100)}，切换下一个凭证...`);
+      const nextCred = await getNextCredentialAsync();
+      if (nextCred) {
+        credential = nextCred;
+        continue;
+      }
+      break;
     }
   }
   
