@@ -75,9 +75,10 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
           }
         }
         
+        const provider = c.provider || 'gemini';
         return {
           account_id: c.account_id,
-          provider: c.provider || 'gemini',
+          provider,
           project_id: c.project_id,
           has_refresh_token: !!c.refresh_token,
           is_expired: !!(c.expires_at && c.expires_at < Date.now()),
@@ -85,7 +86,8 @@ export async function managementRoutes(fastify: FastifyInstance): Promise<void> 
           rate_limited_until: c.rate_limited_until || 0,
           last_used_at: c.last_used_at || 0,
           proxy_url: c.proxy_url || null,
-          preview: c.preview !== false, // default to true
+          // preview 仅对 gemini 有效
+          preview: provider === 'gemini' ? (c.preview !== false) : undefined,
           validation_required: c.validation_required || false,
           validation_url: c.validation_url || null,
           model_cooldowns: activeCooldowns,

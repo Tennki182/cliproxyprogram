@@ -303,14 +303,16 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
             }
           }
         }
+        const provider = c.provider || 'gemini';
         return {
           account_id: c.account_id,
           project_id: c.project_id,
           expires_at: c.expires_at,
           has_refresh_token: !!c.refresh_token,
-          provider: c.provider || 'gemini',
+          provider,
           proxy_url: c.proxy_url || null,
-          preview: c.preview !== false,
+          // preview 仅对 gemini 有效
+          preview: provider === 'gemini' ? (c.preview !== false) : undefined,
           validation_required: c.validation_required || false,
           validation_url: c.validation_url || null,
           model_cooldowns: activeCooldowns,
