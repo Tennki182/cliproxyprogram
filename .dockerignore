@@ -26,8 +26,14 @@ Dockerfile*
 docker-compose*.yml
 .dockerignore
 
-# Keep entrypoint script
+# Scripts (keep for CI/CD)
+!scripts/
+!scripts/*.sh
+
+# Keep these files in context
 !docker-entrypoint.sh
+!Makefile
+!.env.example
 
 # Documentation
 *.md

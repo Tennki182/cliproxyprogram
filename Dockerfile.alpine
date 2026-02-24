@@ -1,0 +1,67 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ProxyCLI - Alpine-based Dockerfile (Smaller Image)
+# ═══════════════════════════════════════════════════════════════════════════════
+# This Dockerfile uses Alpine Linux for a smaller final image (~100MB vs ~200MB)
+# Usage: docker build -f Dockerfile.alpine -t proxycli:alpine .
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Stage 1: Dependencies ─────────────────────────────────────────────────────
+FROM node:22-alpine AS deps
+
+WORKDIR /app
+
+# Install dependencies
+COPY package.json package-lock.json* ./
+RUN npm ci --only=production
+
+# ── Stage 2: Builder ──────────────────────────────────────────────────────────
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Install build tools
+RUN apk add --no-cache python3 make g++
+
+# Copy dependencies
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy source and build
+COPY package.json tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+
+# ── Stage 3: Production ───────────────────────────────────────────────────────
+FROM node:22-alpine AS production
+
+LABEL org.opencontainers.image.title="ProxyCLI (Alpine)"
+LABEL org.opencontainers.image.description="Lightweight multi-provider AI reverse proxy"
+LABEL org.opencontainers.image.source="https://github.com/yourusername/proxycli"
+
+WORKDIR /app
+
+# Install gosu for user switching
+RUN apk add --no-cache gosu
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S app -u 1001 -G nodejs
+
+# Copy production files
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --chown=app:nodejs public/ ./public/
+COPY package.json docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh
+
+# Create data directory
+RUN mkdir -p /app/data && chown -R app:nodejs /app/data
+
+USER app
+
+EXPOSE 8488
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD node -e "fetch('http://localhost:8488/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["node", "dist/index.js"]

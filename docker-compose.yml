@@ -107,6 +107,18 @@ services:
   #     - WATCHTOWER_POLL_INTERVAL=3600
   #   restart: unless-stopped
 
+  # ── Optional: Backup service ─────────────────────────────────────────────────
+  # backup:
+  #   image: offen/docker-volume-backup:latest
+  #   container_name: proxycli-backup
+  #   volumes:
+  #     - ./data:/backup/data:ro
+  #     - ./backups:/archive
+  #   environment:
+  #     - BACKUP_CRON_EXPRESSION=0 2 * * *
+  #     - BACKUP_RETENTION_DAYS=7
+  #   restart: unless-stopped
+
 # ── Networks ───────────────────────────────────────────────────────────────────
 networks:
   proxycli-network:
