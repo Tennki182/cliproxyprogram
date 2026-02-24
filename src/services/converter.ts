@@ -13,6 +13,7 @@ import {
   GeminiThinkingConfig,
 } from '../types/gemini.js';
 import { normalizeFunctionName } from './pinyin.js';
+import { logWarn, logInfo } from './log-stream.js';
 
 export interface ConvertOptions {
   includeThoughtSignature?: boolean;
@@ -133,10 +134,13 @@ export function convertMessagesToContents(
   const contents: GeminiContent[] = [];
   const includeThought = options?.includeThoughtSignature ?? true;
   
+  // Process thinking blocks: filter invalid ones and sanitize
+  const processedMessages = processThinkingBlocks(messages);
+  
   // Build tool_call_id -> function name mapping for tool responses
-  const toolCallIdToName = buildToolCallIdToNameMap(messages);
+  const toolCallIdToName = buildToolCallIdToNameMap(processedMessages);
 
-  for (const msg of messages) {
+  for (const msg of processedMessages) {
     // Skip system messages - Gemini uses systemInstruction separately
     if (msg.role === 'system') continue;
 
@@ -1117,4 +1121,222 @@ export function getToolSchema(functionName: string): Record<string, unknown> | u
  */
 export function clearToolSchemaCache(): void {
   toolSchemaCache.clear();
+}
+
+// ==================== Thinking Block Validation and Sanitization ====================
+
+/**
+ * Minimum valid signature length for thinking blocks
+ */
+const MIN_SIGNATURE_LENGTH = 10;
+
+/**
+ * Check if a thinking block has a valid thoughtSignature
+ * 
+ * Valid cases:
+ * 1. Empty thinking + any thoughtSignature = valid (trailing signature case)
+ * 2. Has content + sufficiently long thoughtSignature = valid
+ * 
+ * @param block - Content block to check
+ * @returns Whether the block has valid thoughtSignature
+ */
+export function hasValidThoughtSignature(block: Record<string, unknown>): boolean {
+  if (typeof block !== 'object' || block === null) {
+    return true;
+  }
+  
+  const blockType = block.type as string;
+  if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
+    return true; // Non-thinking blocks are valid by default
+  }
+  
+  const thinking = block.thinking as string || '';
+  const thoughtSignature = block.thoughtSignature as string | undefined;
+  
+  // Empty thinking + any thoughtSignature = valid (trailing signature case)
+  if (!thinking && thoughtSignature !== undefined) {
+    return true;
+  }
+  
+  // Has content + sufficiently long thoughtSignature = valid
+  if (thoughtSignature && typeof thoughtSignature === 'string' && thoughtSignature.length >= MIN_SIGNATURE_LENGTH) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Sanitize a thinking block by keeping only necessary fields
+ * Removes extra fields like cache_control
+ * 
+ * @param block - Thinking block to sanitize
+ * @returns Sanitized block with only essential fields
+ */
+export function sanitizeThinkingBlock(block: Record<string, unknown>): Record<string, unknown> {
+  if (typeof block !== 'object' || block === null) {
+    return block;
+  }
+  
+  const blockType = block.type as string;
+  if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
+    return block;
+  }
+  
+  // Rebuild block with only necessary fields
+  const sanitized: Record<string, unknown> = {
+    type: blockType,
+    thinking: block.thinking || '',
+  };
+  
+  const thoughtSignature = block.thoughtSignature as string | undefined;
+  if (thoughtSignature) {
+    sanitized.thoughtSignature = thoughtSignature;
+  }
+  
+  return sanitized;
+}
+
+/**
+ * Remove trailing unsigned thinking blocks from a content array
+ * Modifies the array in place
+ * 
+ * @param blocks - Content blocks array (will be modified)
+ */
+export function removeTrailingUnsignedThinking(blocks: Record<string, unknown>[]): void {
+  if (!blocks || blocks.length === 0) {
+    return;
+  }
+  
+  // Scan from end to beginning
+  let endIndex = blocks.length;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (typeof block !== 'object' || block === null) {
+      break;
+    }
+    
+    const blockType = block.type as string;
+    if (blockType === 'thinking' || blockType === 'redacted_thinking') {
+      if (!hasValidThoughtSignature(block)) {
+        endIndex = i;
+      } else {
+        break; // Found valid signature, stop
+      }
+    } else {
+      break; // Found non-thinking block, stop
+    }
+  }
+  
+  if (endIndex < blocks.length) {
+    blocks.splice(endIndex);
+    // Log if needed: console.debug(`Removed trailing unsigned thinking block(s)`);
+  }
+}
+
+/**
+ * Filter invalid thinking blocks from messages and sanitize all thinking blocks
+ * 
+ * This function:
+ * 1. Removes thinking blocks with invalid signatures (converts to text)
+ * 2. Sanitizes valid thinking blocks (removes extra fields like cache_control)
+ * 3. Ensures messages have valid content after filtering
+ * 
+ * @param messages - OpenAI messages array (will be modified)
+ */
+export function filterInvalidThinkingBlocks(messages: OpenAIMessage[]): void {
+  let totalFiltered = 0;
+  
+  for (const msg of messages) {
+    // Only process assistant/model messages
+    if (msg.role !== 'assistant') {
+      continue;
+    }
+    
+    const content = msg.content;
+    if (typeof content !== 'object' || !Array.isArray(content)) {
+      continue;
+    }
+    
+    // Process each content block
+    const newBlocks: any[] = [];
+    
+    for (const block of content) {
+      if (typeof block !== 'object' || block === null) {
+        newBlocks.push(block);
+        continue;
+      }
+      
+      const blockRecord = block as unknown as Record<string, unknown>;
+      const blockType = blockRecord.type as string;
+      
+      // Skip non-thinking blocks
+      if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
+        newBlocks.push(block);
+        continue;
+      }
+      
+      // All thinking blocks need sanitization (remove cache_control etc.)
+      if (hasValidThoughtSignature(blockRecord)) {
+        // Valid signature, sanitize and keep
+        newBlocks.push(sanitizeThinkingBlock(blockRecord));
+      } else {
+        // Invalid signature, convert to text block
+        const thinkingText = (blockRecord.thinking as string) || '';
+        if (thinkingText.trim()) {
+          logInfo(`[ThinkingFilter] Converting invalid thinking block to text (${thinkingText.length} chars)`);
+          newBlocks.push({ type: 'text', text: thinkingText });
+        }
+        totalFiltered++;
+      }
+    }
+    
+    // Update message content (ensure at least one block exists)
+    (msg as any).content = newBlocks.length > 0 ? newBlocks : [{ type: 'text', text: '' }];
+  }
+  
+  if (totalFiltered > 0) {
+    logWarn(`[ThinkingFilter] Filtered ${totalFiltered} invalid thinking block(s) from history`);
+  }
+}
+
+/**
+ * Process messages to handle thinking blocks for Gemini API
+ * 
+ * This is the main entry point for thinking block processing:
+ * 1. Filter invalid thinking blocks (convert to text)
+ * 2. Remove trailing unsigned thinking blocks
+ * 
+ * @param messages - OpenAI messages array
+ * @returns Processed messages array
+ */
+export function processThinkingBlocks(messages: OpenAIMessage[]): OpenAIMessage[] {
+  if (!messages || messages.length === 0) {
+    return messages;
+  }
+  
+  // Deep clone to avoid modifying original
+  const processed = messages.map(msg => ({
+    ...msg,
+    content: typeof msg.content === 'object' && Array.isArray(msg.content)
+      ? [...msg.content]
+      : msg.content,
+  }));
+  
+  // Filter invalid thinking blocks
+  filterInvalidThinkingBlocks(processed);
+  
+  // Remove trailing unsigned thinking blocks from last assistant message
+  for (let i = processed.length - 1; i >= 0; i--) {
+    const msg = processed[i];
+    if (msg.role === 'assistant') {
+      const content = msg.content;
+      if (typeof content === 'object' && Array.isArray(content)) {
+        removeTrailingUnsignedThinking(content as any[]);
+      }
+      break;
+    }
+  }
+  
+  return processed;
 }
