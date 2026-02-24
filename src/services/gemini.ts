@@ -276,8 +276,8 @@ async function requestWithRetry(
  */
 async function* handleStreamResponse(
   response: Response, 
-  accountId: string,
-  modelName: string
+  _accountId: string,
+  _modelName: string
 ): AsyncIterable<any> {
   if (!response.body) {
     throw new Error('流式响应无数据');
