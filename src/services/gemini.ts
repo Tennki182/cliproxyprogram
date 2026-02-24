@@ -10,7 +10,6 @@ import { acquireCredential, AcquireCredentialOptions } from './rotation.js';
 import { 
   setCredentialPreview, 
   setCredentialValidationRequired, 
-  setModelCooldown,
   markCredentialRateLimited,
 } from '../storage/credentials.js';
 import { logError, logWarn } from './log-stream.js';
@@ -30,9 +29,8 @@ const DEFAULT_HEADERS: Record<string, string> = {
   'Client-Metadata': 'ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI',
 };
 
-// Retry configuration
-const MAX_RETRIES = 5;
-// RETRY_INTERVAL_MS removed - now using immediate credential switch for 429 errors
+// Retry configuration - 增加重试次数以遍历更多凭证
+const MAX_RETRIES = 10;
 
 /**
  * Build the API URL for cloudcode-pa.googleapis.com/v1internal
@@ -64,57 +62,6 @@ async function getCredential(opts?: AcquireCredentialOptions): Promise<Credentia
     accountId: credential.account_id,
     credential,
   };
-}
-
-/**
- * Check if error is a "No capacity available" error that needs immediate credential switch
- */
-function isNoCapacityError(errorBody: string): boolean {
-  try {
-    const errorJson = JSON.parse(errorBody);
-    const errorMsg = errorJson.error?.message || '';
-    return errorMsg.includes('No capacity available') || 
-           errorMsg.includes('RESOURCE_EXHAUSTED');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Parse cooldown time from error response
- * Returns cooldown until timestamp (epoch ms) or null if no cooldown info
- */
-function parseCooldownFromError(errorBody: string): number | null {
-  try {
-    const errorJson = JSON.parse(errorBody);
-    // Check for quota exhaustion with retry delay
-    const details = errorJson.error?.details;
-    if (Array.isArray(details)) {
-      for (const detail of details) {
-        if (detail['@type']?.includes('RetryInfo')) {
-          const retryDelay = detail.retryDelay;
-          if (retryDelay) {
-            // Parse "Xs" or "X.Ys" format
-            const seconds = parseFloat(retryDelay.replace('s', ''));
-            if (!isNaN(seconds)) {
-              return Date.now() + seconds * 1000;
-            }
-          }
-        }
-      }
-    }
-    
-    // Check for rate limit info in error message
-    const errorMsg = errorJson.error?.message || '';
-    const quotaMatch = errorMsg.match(/Quota exceeded.*?Retry after (\d+)/i);
-    if (quotaMatch) {
-      const seconds = parseInt(quotaMatch[1], 10);
-      return Date.now() + seconds * 1000;
-    }
-  } catch {
-    // Ignore parsing errors
-  }
-  return null;
 }
 
 /**
@@ -155,8 +102,8 @@ function parseValidationError(errorBody: string): { isValidationError: boolean; 
 }
 
 /**
- * Perform API request with retry logic for 429/503 errors
- * Handles credential switching and model cooldown tracking
+ * Perform API request with retry logic
+ * Simple credential rotation on errors - no cooldown tracking, just retry
  */
 async function requestWithRetry(
   url: string,
@@ -165,21 +112,28 @@ async function requestWithRetry(
   isStream: boolean = false
 ): Promise<Response | AsyncIterable<any>> {
   let lastError: Error | null = null;
-  let currentCredential: CredentialInfo | null = null;
+  const triedCredentials = new Set<string>();
   
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    // Get credential with model-specific filtering
-    try {
-      currentCredential = await getCredential({ modelName });
-    } catch (e: any) {
-      if (attempt === 0) throw e;
-      // If we can't get a new credential, use the last error
-      throw lastError || e;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    // Get next available credential
+    const credential = await getCredential({ modelName });
+    
+    if (!credential) {
+      throw new Error('没有可用的凭证，请检查认证状态');
     }
     
-    const { accessToken, projectId, accountId } = currentCredential;
+    const credKey = `${credential.accountId}:${credential.credential?.provider || 'gemini'}`;
     
-    // Update body with current project (body may already have project from buildRequestBody)
+    // If we've tried all credentials, continue anyway with retry delay
+    if (triedCredentials.has(credKey)) {
+      logWarn(`所有凭证已尝试一遍，等待后重试 (${attempt + 1}/${MAX_RETRIES})`);
+      await new Promise(r => setTimeout(r, 500));
+    }
+    triedCredentials.add(credKey);
+    
+    const { accessToken, projectId, accountId } = credential;
+    
+    // Update body with current project
     const requestBody = { ...body };
     requestBody.project = projectId;
     
@@ -198,56 +152,33 @@ async function requestWithRetry(
         const errorText = await response.text();
         const statusCode = response.status;
         
-        // Handle 403 account validation error
+        // Parse error message for logging
+        let errorMessage = errorText;
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorMessage = errorJson.error?.message || errorJson.error?.status || errorText;
+        } catch { /* use raw text */ }
+        
+        // Handle 403 account validation error - mark and retry
         if (statusCode === 403) {
           const validationInfo = parseValidationError(errorText);
           if (validationInfo.isValidationError) {
             logError(`凭证 ${accountId} 需要账号验证: ${validationInfo.validationUrl || '未知链接'}`);
             setCredentialValidationRequired(accountId, true, validationInfo.validationUrl, 'gemini');
-            
-            // Try next credential
-            if (attempt < MAX_RETRIES) {
-              logWarn(`尝试使用下一个凭证 (验证错误)...`);
-              continue;
-            }
+            continue; // Try next credential
           }
         }
         
-        // Handle 404 preview model error
+        // Handle 404 preview model error - mark and retry
         if (statusCode === 404 && modelName.toLowerCase().includes('preview')) {
           logWarn(`凭证 ${accountId} 不支持 preview 模型，标记为 non-preview`);
           setCredentialPreview(accountId, false, 'gemini');
-          
-          // Try next credential
-          if (attempt < MAX_RETRIES) {
-            logWarn(`尝试使用下一个凭证 (preview 不支持)...`);
-            continue;
-          }
+          continue; // Try next credential
         }
         
-        // Handle 429/503 with retry
-        if ((statusCode === 429 || statusCode === 503) && attempt < MAX_RETRIES) {
-          const cooldownUntil = parseCooldownFromError(errorText);
-          
-          // Check if this is a "No capacity available" error - switch credential immediately
-          if (isNoCapacityError(errorText)) {
-            const shortCooldown = Math.floor(Date.now() / 1000) + 30; // 30s cooldown for capacity issues
-            logWarn(`凭证 ${accountId} 容量不足 (No capacity)，模型: ${modelName}，立即切换凭证`);
-            setModelCooldown(accountId, modelName, shortCooldown, 'gemini');
-            // Don't wait, immediately try next credential
-            continue;
-          }
-          
-          if (cooldownUntil) {
-            // Has cooldown - set model cooldown and try next credential
-            logWarn(`凭证 ${accountId} 触发冷却，模型: ${modelName}，冷却至: ${new Date(cooldownUntil).toISOString()}`);
-            setModelCooldown(accountId, modelName, Math.floor(cooldownUntil / 1000), 'gemini');
-          } else {
-            // No cooldown info - mark with short cooldown and try next credential immediately
-            const shortCooldown = Math.floor(Date.now() / 1000) + 10; // 10s cooldown
-            logWarn(`凭证 ${accountId} 返回 ${statusCode}，无冷却时间，立即切换凭证`);
-            setModelCooldown(accountId, modelName, shortCooldown, 'gemini');
-          }
+        // Handle 429/503 - simply retry with next credential (no cooldown marking)
+        if ((statusCode === 429 || statusCode === 503) && attempt < MAX_RETRIES - 1) {
+          logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
           continue;
         }
         
@@ -257,20 +188,14 @@ async function requestWithRetry(
         if (autoBanCodes.includes(statusCode)) {
           logError(`凭证 ${accountId} 返回 ${statusCode}，自动禁用`);
           markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 3600, 'gemini');
+          continue; // Try next credential
         }
         
-        // Non-retryable error
-        let errorMessage: string;
-        try {
-          const errorJson = JSON.parse(errorText);
-          errorMessage = errorJson.error?.message || errorJson.error?.status || errorText;
-        } catch {
-          errorMessage = errorText;
-        }
+        // Non-retryable error - throw immediately
         throw new Error(`Gemini API 错误 (${statusCode}): ${errorMessage}`);
       }
       
-      // Success
+      // Success - return response
       if (isStream) {
         return handleStreamResponse(response, accountId, modelName);
       }
@@ -279,20 +204,28 @@ async function requestWithRetry(
     } catch (error: any) {
       lastError = error;
       
-      // Network errors - retry with same or next credential
-      if (error.message?.includes('Network error') && attempt < MAX_RETRIES) {
-        logWarn(`网络错误，尝试下一个凭证... (${attempt + 1}/${MAX_RETRIES})`);
+      // Network errors - retry with next credential
+      if (error.message?.includes('Network error') && attempt < MAX_RETRIES - 1) {
+        logWarn(`网络错误，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
       
-      // If not retryable or last attempt, throw
-      if (attempt >= MAX_RETRIES) {
+      // If it's a thrown error from above (non-retryable), re-throw
+      if (error.message?.includes('Gemini API 错误')) {
         throw error;
       }
+      
+      // Other errors - continue to next credential if not last attempt
+      if (attempt < MAX_RETRIES - 1) {
+        logWarn(`请求错误: ${error.message?.substring(0, 100)}，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+      
+      throw error;
     }
   }
   
-  throw lastError || new Error('所有重试均失败');
+  throw lastError || new Error('所有重试均失败，没有可用凭证');
 }
 
 /**
