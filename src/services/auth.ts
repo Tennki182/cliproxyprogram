@@ -389,7 +389,9 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
   }
 
   const apiKey = userInfo.data.apiKey;
-  const email = userInfo.data.email || userInfo.data.phone || accountId;
+  // Use original accountId to ensure credential is updated, not recreated
+  // User info email/phone may differ from original account_id format
+  const resolvedAccountId = accountId;
 
   const now = Date.now();
   const expiresAt = tokens.expires_in
@@ -397,7 +399,7 @@ export async function refreshIFlowToken(refreshToken: string, accountId: string)
     : undefined;
 
   const credential: Credential = {
-    account_id: email,
+    account_id: resolvedAccountId, // Keep original account_id to update existing credential
     access_token: apiKey, // iFlow uses API key as access token
     refresh_token: tokens.refresh_token || refreshToken,
     expires_at: expiresAt,
