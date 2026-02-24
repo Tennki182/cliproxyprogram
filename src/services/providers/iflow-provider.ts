@@ -4,9 +4,9 @@ import { Provider } from '../provider.js';
 import { pfetch } from '../http.js';
 import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getIFlowOAuthConfig, getConfig } from '../../config.js';
-import { getCredential as getStoredCredential, saveCredential, markCredentialRateLimited } from '../../storage/credentials.js';
+import { getCredential as getStoredCredential, saveCredential } from '../../storage/credentials.js';
 import { logWarn, logInfo } from '../log-stream.js';
-import { calculateRequestTokens, parseStreamUsage, countMessagesTokens } from '../token-counter.js';
+import { calculateRequestTokens, countMessagesTokens } from '../token-counter.js';
 
 interface IFlowTokenData {
   access_token: string;
@@ -66,7 +66,7 @@ async function refreshCookieBasedAPIKey(cookie: string, email: string): Promise<
     throw new Error(`Cookie refresh failed: ${response.status}`);
   }
 
-  const data = await response.json();
+  const data = await response.json() as Record<string, any>;
   return {
     api_key: data.api_key,
     expire_time: data.expire_time || data.expires_at,
@@ -96,7 +96,7 @@ async function refreshOAuthTokens(refreshToken: string): Promise<IFlowTokenData>
     throw new Error(`Token refresh failed: ${response.status}`);
   }
 
-  const data = await response.json();
+  const data = await response.json() as Record<string, any>;
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
@@ -226,7 +226,7 @@ export class IFlowProvider implements Provider {
 
     const iflowConfig = getIFlowOAuthConfig();
     // iFlow stores the API key in access_token after OAuth flow
-    const apiKey = cred.access_token;
+    const apiKey = cred!.access_token;
     const sessionId = `session-${randomUUID()}`;
     const ts = Date.now();
     const signature = createSignature(apiKey, sessionId, ts);
@@ -260,12 +260,12 @@ export class IFlowProvider implements Provider {
         'Accept': 'application/json',
       },
       body: JSON.stringify(body),
-    }, { proxyUrl: cred.proxy_url || undefined });
+    }, { proxyUrl: cred!.proxy_url || undefined });
 
     if (!response.ok) {
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred.account_id, retryAfter);
+        reportRateLimit(cred!.account_id, retryAfter);
       }
       const errorText = await response.text();
       throw new Error(`iFlow API 错误 (${response.status}): ${errorText}`);
@@ -298,7 +298,7 @@ export class IFlowProvider implements Provider {
     cred = await this.refreshIfNeeded(cred);
 
     const iflowConfig = getIFlowOAuthConfig();
-    const apiKey = cred.access_token;
+    const apiKey = cred!.access_token;
     const sessionId = `session-${randomUUID()}`;
     const ts = Date.now();
     const signature = createSignature(apiKey, sessionId, ts);
@@ -335,12 +335,12 @@ export class IFlowProvider implements Provider {
         'Accept': 'text/event-stream',
       },
       body: JSON.stringify(body),
-    }, { proxyUrl: cred.proxy_url || undefined });
+    }, { proxyUrl: cred!.proxy_url || undefined });
 
     if (!response.ok) {
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
-        reportRateLimit(cred.account_id, retryAfter);
+        reportRateLimit(cred!.account_id, retryAfter);
       }
       const errorText = await response.text();
       throw new Error(`iFlow API 错误 (${response.status}): ${errorText}`);
