@@ -11,8 +11,9 @@ import {
   setCredentialPreview, 
   setCredentialValidationRequired, 
   markCredentialRateLimited,
+  listCredentials,
 } from '../storage/credentials.js';
-import { logError, logWarn } from './log-stream.js';
+import { logWarn } from './log-stream.js';
 
 const SAFETY_SETTINGS = [
   { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
@@ -28,9 +29,6 @@ const DEFAULT_HEADERS: Record<string, string> = {
   'X-Goog-Api-Client': 'gl-node/22.17.0',
   'Client-Metadata': 'ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI',
 };
-
-// Retry configuration - 增加重试次数以遍历更多凭证
-const MAX_RETRIES = 10;
 
 /**
  * Build the API URL for cloudcode-pa.googleapis.com/v1internal
@@ -102,8 +100,36 @@ function parseValidationError(errorBody: string): { isValidationError: boolean; 
 }
 
 /**
+ * Check if error is fatal (should not retry with other credentials)
+ * 4xx errors (except 429, 403 validation, 404 preview) are client errors, should not retry
+ */
+function isFatalError(statusCode: number): boolean {
+  // 5xx server errors - retry with other credentials
+  if (statusCode >= 500 && statusCode !== 503) {
+    return false;
+  }
+  // 429 rate limit - retry with other credentials
+  if (statusCode === 429) {
+    return false;
+  }
+  // 503 service unavailable - retry with other credentials
+  if (statusCode === 503) {
+    return false;
+  }
+  // 403, 404 with special handling - not fatal
+  if (statusCode === 403 || statusCode === 404) {
+    return false;
+  }
+  // Other 4xx errors are fatal (client errors)
+  if (statusCode >= 400 && statusCode < 500) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Perform API request with retry logic
- * Simple credential rotation on errors - no cooldown tracking, just retry
+ * Try ALL available credentials before giving up
  */
 async function requestWithRetry(
   url: string,
@@ -111,25 +137,39 @@ async function requestWithRetry(
   modelName: string,
   isStream: boolean = false
 ): Promise<Response | AsyncIterable<any>> {
-  let lastError: Error | null = null;
+  const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
   const triedCredentials = new Set<string>();
+  let credentialCount = 0;
   
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  // Get all available gemini credentials
+  const allCredentials = listCredentials().filter(c => c.provider === 'gemini' || !c.provider);
+  const totalCredentials = allCredentials.length;
+  
+  if (totalCredentials === 0) {
+    throw new Error('没有可用的 Gemini 凭证，请检查认证状态');
+  }
+  
+  logWarn(`开始请求，共有 ${totalCredentials} 个凭证可用`);
+  
+  while (credentialCount < totalCredentials) {
     // Get next available credential
-    const credential = await getCredential({ modelName });
-    
-    if (!credential) {
-      throw new Error('没有可用的凭证，请检查认证状态');
+    let credential: CredentialInfo;
+    try {
+      credential = await getCredential({ modelName });
+    } catch (e: any) {
+      // No more credentials available
+      break;
     }
     
-    const credKey = `${credential.accountId}:${credential.credential?.provider || 'gemini'}`;
+    const credKey = `${credential.accountId}:gemini`;
     
-    // If we've tried all credentials, continue anyway with retry delay
+    // Skip if already tried this credential
     if (triedCredentials.has(credKey)) {
-      logWarn(`所有凭证已尝试一遍，等待后重试 (${attempt + 1}/${MAX_RETRIES})`);
-      await new Promise(r => setTimeout(r, 500));
+      credentialCount++;
+      continue;
     }
     triedCredentials.add(credKey);
+    credentialCount++;
     
     const { accessToken, projectId, accountId } = credential;
     
@@ -159,40 +199,52 @@ async function requestWithRetry(
           errorMessage = errorJson.error?.message || errorJson.error?.status || errorText;
         } catch { /* use raw text */ }
         
-        // Handle 403 account validation error - mark and retry
+        // Record this error
+        errors.push({ accountId, statusCode, message: errorMessage.substring(0, 200) });
+        
+        // Handle 403 account validation error - mark and try next credential
         if (statusCode === 403) {
           const validationInfo = parseValidationError(errorText);
           if (validationInfo.isValidationError) {
-            logError(`凭证 ${accountId} 需要账号验证: ${validationInfo.validationUrl || '未知链接'}`);
+            logWarn(`凭证 ${accountId} 需要账号验证，尝试下一个凭证...`);
             setCredentialValidationRequired(accountId, true, validationInfo.validationUrl, 'gemini');
-            continue; // Try next credential
+            continue;
           }
-        }
-        
-        // Handle 404 preview model error - mark and retry
-        if (statusCode === 404 && modelName.toLowerCase().includes('preview')) {
-          logWarn(`凭证 ${accountId} 不支持 preview 模型，标记为 non-preview`);
-          setCredentialPreview(accountId, false, 'gemini');
-          continue; // Try next credential
-        }
-        
-        // Handle 429/503 - simply retry with next credential (no cooldown marking)
-        if ((statusCode === 429 || statusCode === 503) && attempt < MAX_RETRIES - 1) {
-          logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
+          // 403 without validation - might be permission issue, try next
+          logWarn(`凭证 ${accountId} 返回 403，尝试下一个凭证...`);
           continue;
         }
         
-        // Handle auto-ban error codes
-        const config = getConfig();
-        const autoBanCodes = config.gemini.autoBanErrorCodes || [403];
-        if (autoBanCodes.includes(statusCode)) {
-          logError(`凭证 ${accountId} 返回 ${statusCode}，自动禁用`);
-          markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 3600, 'gemini');
+        // Handle 404 preview model error - mark and try next credential
+        if (statusCode === 404 && modelName.toLowerCase().includes('preview')) {
+          logWarn(`凭证 ${accountId} 不支持 preview 模型，标记为 non-preview，尝试下一个凭证...`);
+          setCredentialPreview(accountId, false, 'gemini');
+          continue;
+        }
+        
+        // Handle 429/503 - smooth credential switching without marking cooldown
+        if (statusCode === 429 || statusCode === 503) {
+          logWarn(`凭证 ${accountId} 触发限流 (${statusCode})，平滑切换至下一个凭证 (${credentialCount}/${totalCredentials})`);
           continue; // Try next credential
         }
         
-        // Non-retryable error - throw immediately
-        throw new Error(`Gemini API 错误 (${statusCode}): ${errorMessage}`);
+        // Handle auto-ban error codes - mark but still try next credential
+        const config = getConfig();
+        const autoBanCodes = config.gemini.autoBanErrorCodes || [403];
+        if (autoBanCodes.includes(statusCode)) {
+          logWarn(`凭证 ${accountId} 返回 ${statusCode}，自动禁用，尝试下一个凭证...`);
+          markCredentialRateLimited(accountId, Math.floor(Date.now() / 1000) + 3600, 'gemini');
+          continue;
+        }
+        
+        // Check if fatal error (should not retry)
+        if (isFatalError(statusCode)) {
+          throw new Error(`Gemini API 错误 (${statusCode}): ${errorMessage}`);
+        }
+        
+        // Other errors - try next credential
+        logWarn(`凭证 ${accountId} 返回 ${statusCode}，尝试下一个凭证...`);
+        continue;
       }
       
       // Success - return response
@@ -202,30 +254,40 @@ async function requestWithRetry(
       return response;
       
     } catch (error: any) {
-      lastError = error;
+      // Record error
+      const errorMsg = error.message || '未知错误';
+      errors.push({ accountId, statusCode: 0, message: errorMsg.substring(0, 200) });
       
-      // Network errors - retry with next credential
-      if (error.message?.includes('Network error') && attempt < MAX_RETRIES - 1) {
-        logWarn(`网络错误，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
+      // Network errors - try next credential
+      if (error.message?.includes('Network error')) {
+        logWarn(`凭证 ${accountId} 网络错误，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
         continue;
       }
       
       // If it's a thrown error from above (non-retryable), re-throw
-      if (error.message?.includes('Gemini API 错误')) {
+      if (error.message?.includes('Gemini API 错误') && isFatalError(parseInt(error.message.match(/\((\d+)\)/)?.[1] || '0'))) {
         throw error;
       }
       
-      // Other errors - continue to next credential if not last attempt
-      if (attempt < MAX_RETRIES - 1) {
-        logWarn(`请求错误: ${error.message?.substring(0, 100)}，切换凭证重试 (${attempt + 1}/${MAX_RETRIES})`);
-        continue;
-      }
-      
-      throw error;
+      // Other errors - try next credential
+      logWarn(`凭证 ${accountId} 请求错误: ${errorMsg.substring(0, 100)}，尝试下一个凭证 (${credentialCount}/${totalCredentials})...`);
+      continue;
     }
   }
   
-  throw lastError || new Error('所有重试均失败，没有可用凭证');
+  // All credentials exhausted - construct comprehensive error message
+  const uniqueErrors = new Map<number, string>();
+  for (const err of errors) {
+    if (!uniqueErrors.has(err.statusCode)) {
+      uniqueErrors.set(err.statusCode, err.message);
+    }
+  }
+  
+  const errorSummary = Array.from(uniqueErrors.entries())
+    .map(([code, msg]) => `[${code}] ${msg.substring(0, 100)}`)
+    .join('; ');
+  
+  throw new Error(`所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
 }
 
 /**
