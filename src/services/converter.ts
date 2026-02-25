@@ -247,9 +247,21 @@ export function extractSystemInstruction(
 
 /**
  * Parse thinking settings from model name
- * Supports model name suffixes like -max, -high, -medium, -low, -minimal
+ * 
+ * Supports two formats:
+ * 1. Parentheses format (CLIProxyAPI style): gemini-2.5-pro(8192), gemini-3-pro(high)
+ * 2. Hyphen suffix format: gemini-2.5-pro-high, gemini-2.5-pro-medium
+ * 
+ * Priority: parentheses format > hyphen suffix format
  */
-export function getThinkingSettingsFromModel(modelName: string): { thinkingBudget?: number; thinkingLevel?: string } | null {
+export function getThinkingSettingsFromModel(modelName: string): { thinkingBudget?: number; thinkingLevel?: string; baseModel?: string } | null {
+  // First, try to parse parentheses format: model-name(value)
+  const suffixResult = parseThinkingSuffix(modelName);
+  if (suffixResult.hasSuffix) {
+    return suffixResult.config;
+  }
+  
+  // Fallback to hyphen suffix format
   const lowerModel = modelName.toLowerCase();
   
   // Check for thinking-related suffixes
@@ -286,7 +298,7 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
   if (lowerModel.includes('-high')) {
     if (isGemini25) {
       return { thinkingBudget: 16000 };
-    } else if (isGemini3 && isFlash) {
+    } else if (isGemini3) {
       return { thinkingLevel: 'high' };
     }
   }
@@ -294,15 +306,15 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
   if (lowerModel.includes('-medium')) {
     if (isGemini25) {
       return { thinkingBudget: 8192 };
-    } else if (isGemini3 && isFlash) {
+    } else if (isGemini3) {
       return { thinkingLevel: 'medium' };
     }
   }
-  
+
   if (lowerModel.includes('-low')) {
     if (isGemini25) {
       return { thinkingBudget: 1024 };
-    } else if (isGemini3 && isFlash) {
+    } else if (isGemini3) {
       return { thinkingLevel: 'low' };
     }
   }
@@ -318,6 +330,103 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
 }
 
 /**
+ * Parse thinking suffix from model name in parentheses format
+ * 
+ * Format: model-name(value) where value can be:
+ * - Numeric budget: gemini-2.5-pro(8192) -> thinkingBudget: 8192
+ * - Level name: gemini-3-pro(high) -> thinkingLevel: 'high'
+ * - Special values: model(auto), model(none), model(-1)
+ * 
+ * Reference: CLIProxyAPI internal/thinking/suffix.go
+ */
+function parseThinkingSuffix(modelName: string): { hasSuffix: boolean; config: { thinkingBudget?: number; thinkingLevel?: string; baseModel?: string } | null } {
+  // Find the last opening parenthesis
+  const lastOpen = modelName.lastIndexOf('(');
+  if (lastOpen === -1) {
+    return { hasSuffix: false, config: null };
+  }
+  
+  // Check if the string ends with a closing parenthesis
+  if (!modelName.endsWith(')')) {
+    return { hasSuffix: false, config: null };
+  }
+  
+  // Extract components
+  const baseModel = modelName.substring(0, lastOpen);
+  const rawSuffix = modelName.substring(lastOpen + 1, modelName.length - 1);
+  
+  if (!rawSuffix) {
+    return { hasSuffix: false, config: null };
+  }
+  
+  // Parse suffix value
+  const lowerSuffix = rawSuffix.toLowerCase();
+  
+  // 1. Special values: 'none', 'auto', '-1'
+  if (lowerSuffix === 'none') {
+    return {
+      hasSuffix: true,
+      config: { thinkingBudget: 0, thinkingLevel: 'none', baseModel },
+    };
+  }
+  
+  if (lowerSuffix === 'auto' || lowerSuffix === '-1') {
+    return {
+      hasSuffix: true,
+      config: { thinkingBudget: -1, baseModel },
+    };
+  }
+  
+  // 2. Level names: 'minimal', 'low', 'medium', 'high', 'xhigh'
+  const levelMap: Record<string, string> = {
+    'minimal': 'minimal',
+    'low': 'low',
+    'medium': 'medium',
+    'high': 'high',
+    'xhigh': 'xhigh',
+  };
+  
+  if (levelMap[lowerSuffix]) {
+    return {
+      hasSuffix: true,
+      config: { thinkingLevel: levelMap[lowerSuffix], baseModel },
+    };
+  }
+  
+  // 3. Numeric budget
+  const budget = parseInt(rawSuffix, 10);
+  if (!isNaN(budget) && budget >= 0) {
+    return {
+      hasSuffix: true,
+      config: { thinkingBudget: budget, baseModel },
+    };
+  }
+  
+  // Unknown suffix format
+  return { hasSuffix: false, config: null };
+}
+
+/**
+ * Level to budget mapping (reference: CLIProxyAPI)
+ */
+const levelToBudgetMap: Record<string, number> = {
+  'none': 0,
+  'auto': -1,
+  'minimal': 512,
+  'low': 1024,
+  'medium': 8192,
+  'high': 24576,
+  'xhigh': 32768,
+};
+
+/**
+ * Convert thinking level to budget value
+ */
+export function convertLevelToBudget(level: string): number | undefined {
+  return levelToBudgetMap[level.toLowerCase()];
+}
+
+/**
  * Check if model is a search model
  */
 export function isSearchModel(modelName: string): boolean {
@@ -326,8 +435,19 @@ export function isSearchModel(modelName: string): boolean {
 
 /**
  * Get base model name by removing feature suffixes
+ * Supports both hyphen suffix format and parentheses format
  */
 export function getBaseModelName(modelName: string): string {
+  // First, check for parentheses format: model-name(value)
+  const lastOpen = modelName.lastIndexOf('(');
+  if (lastOpen !== -1 && modelName.endsWith(')')) {
+    const baseModel = modelName.substring(0, lastOpen);
+    if (baseModel) {
+      return baseModel;
+    }
+  }
+  
+  // Fallback to hyphen suffix format
   // Order from longest to shortest to avoid partial matches
   const suffixes = [
     '-maxthinking', '-nothinking',  // Legacy
@@ -354,6 +474,12 @@ export function getBaseModelName(modelName: string): string {
 
 /**
  * Convert reasoning_effort to Gemini thinkingConfig
+ * 
+ * Reference: CLIProxyAPI thinking package
+ * - 'auto': thinkingBudget = -1, includeThoughts = true
+ * - 'none': thinkingBudget = 0, includeThoughts = false (Gemini 2.5)
+ *          OR thinkingLevel = 'none', includeThoughts = false (Gemini 3.x)
+ * - 'low'/'medium'/'high': thinkingLevel = effort, includeThoughts = true
  */
 function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'none'): GeminiThinkingConfig | undefined {
   if (!effort) return undefined;
@@ -365,9 +491,21 @@ function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'n
     };
   }
   
+  if (effort === 'none') {
+    // For 'none', we need to explicitly disable thinking
+    // Use thinkingBudget: 0 for Gemini 2.5, thinkingLevel: 'none' for Gemini 3.x
+    // The model-specific handling is done in the provider
+    return {
+      thinkingBudget: 0,
+      thinkingLevel: 'none',
+      includeThoughts: false,
+    };
+  }
+  
+  // 'low', 'medium', 'high' - use thinkingLevel
   return {
-    thinkingLevel: effort === 'none' ? undefined : effort,
-    includeThoughts: effort !== 'none',
+    thinkingLevel: effort,
+    includeThoughts: true,
   };
 }
 
@@ -464,10 +602,18 @@ export function convertToGeminiConfig(
     // Parse thinking settings from model name
     const modelThinkingSettings = getThinkingSettingsFromModel(request.model);
     if (modelThinkingSettings) {
+      // Determine includeThoughts based on budget/level
+      let includeThoughts = true;
+      if (modelThinkingSettings.thinkingBudget === 0) {
+        includeThoughts = false;
+      } else if (modelThinkingSettings.thinkingLevel === 'none') {
+        includeThoughts = false;
+      }
+      
       config.thinkingConfig = {
         thinkingBudget: modelThinkingSettings.thinkingBudget,
         thinkingLevel: modelThinkingSettings.thinkingLevel as any,
-        includeThoughts: true,
+        includeThoughts,
       };
     }
   }

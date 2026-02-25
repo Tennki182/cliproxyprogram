@@ -18,10 +18,66 @@ gemini:
     - gemini-2.5-pro
     - gemini-2.5-flash
     - gemini-2.5-flash-lite
+    # High thinking level variants
+    - gemini-2.5-pro-high
+    - gemini-2.5-flash-high
+    - gemini-2.5-flash-lite-high
+    - gemini-3-pro-high
+    - gemini-3-flash-high
+    - gemini-3.1-pro-high
+    # Medium thinking level variants
+    - gemini-2.5-pro-medium
+    - gemini-2.5-flash-medium
+    - gemini-3-flash-medium
+    # Low thinking level variants
+    - gemini-2.5-pro-low
+    - gemini-2.5-flash-low
+    # Minimal thinking level variants (flash only)
+    - gemini-2.5-flash-minimal
+    # Max thinking level variants
+    - gemini-2.5-pro-max
+    - gemini-2.5-flash-max
+    # Parentheses format for thinking budget
+    - gemini-2.5-pro(high)
+    - gemini-2.5-flash(high)
+    - gemini-2.5-pro(medium)
+    - gemini-2.5-flash(medium)
+    - gemini-2.5-pro(low)
+    - gemini-2.5-flash(low)
+    - gemini-2.5-flash(minimal)
+    - gemini-2.5-pro(max)
+    - gemini-2.5-flash(max)
+    - gemini-2.5-pro(24576)
+    - gemini-2.5-flash(24576)
+    - gemini-2.5-pro(8192)
+    - gemini-2.5-flash(8192)
+    - gemini-2.5-pro(1024)
+    - gemini-2.5-flash(1024)
+    - gemini-3-pro(high)
+    - gemini-3-flash(high)
+    - gemini-3-pro(medium)
+    - gemini-3-flash(medium)
+    - gemini-3-flash(low)
   modelAliases:
     gemini-pro-latest: gemini-2.5-pro
     gemini-flash-latest: gemini-2.5-flash
     gemini-flash-lite-latest: gemini-2.5-flash-lite
+    # High thinking level variants
+    gemini-2.5-pro-high: gemini-2.5-pro
+    gemini-2.5-flash-high: gemini-2.5-flash
+    gemini-2.5-flash-lite-high: gemini-2.5-flash-lite
+    gemini-3-pro-high: gemini-3-pro-preview
+    gemini-3-flash-high: gemini-3-flash-preview
+    gemini-3.1-pro-high: gemini-3.1-pro-preview
+    # Medium thinking level variants
+    gemini-2.5-pro-medium: gemini-2.5-pro
+    gemini-2.5-flash-medium: gemini-2.5-flash
+    gemini-3-flash-medium: gemini-3-flash-preview
+    # Low thinking level variants
+    gemini-2.5-pro-low: gemini-2.5-pro
+    gemini-2.5-flash-low: gemini-2.5-flash
+    # Minimal thinking level variants (flash only)
+    gemini-2.5-flash-minimal: gemini-2.5-flash
   excludedModels: []
 codex:
   enabled: true

@@ -33,8 +33,11 @@ export class GeminiProvider implements Provider {
   async chatCompletion(model: string, request: any): Promise<any> {
     const backend = this.backendFn();
     
+    // Get base model name (remove thinking suffix like "(8192)" or "-high")
+    // The thinking config is already extracted in convertToGeminiConfig
+    let actualModel = getBaseModelName(model);
+    
     // Handle image generation models
-    let actualModel = model;
     if (isImageGenerationModel(model)) {
       actualModel = 'gemini-3-pro-image';
     }
@@ -75,8 +78,11 @@ export class GeminiProvider implements Provider {
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
     const backend = this.backendFn();
     
+    // Get base model name (remove thinking suffix like "(8192)" or "-high")
+    // The thinking config is already extracted in convertToGeminiConfig
+    let actualModel = getBaseModelName(model);
+    
     // Handle image generation models
-    let actualModel = model;
     if (isImageGenerationModel(model)) {
       actualModel = 'gemini-3-pro-image';
     }
@@ -200,17 +206,28 @@ export class GeminiProvider implements Provider {
       }
     }
 
+    // Build usage object with thoughtsTokenCount (reasoning_tokens)
+    const usage: any = {
+      prompt_tokens: response.usageMetadata?.promptTokenCount || 0,
+      completion_tokens: response.usageMetadata?.candidatesTokenCount || 0,
+      total_tokens: response.usageMetadata?.totalTokenCount || 0,
+    };
+    
+    // Add reasoning_tokens from thoughtsTokenCount
+    const thoughtsTokenCount = response.usageMetadata?.thoughtsTokenCount || 0;
+    if (thoughtsTokenCount > 0) {
+      usage.completion_tokens_details = {
+        reasoning_tokens: thoughtsTokenCount,
+      };
+    }
+
     return {
       id: generateId(),
       object: 'chat.completion',
       created: getTimestamp(),
       model,
       choices: [choice],
-      usage: {
-        prompt_tokens: response.usageMetadata?.promptTokenCount || 0,
-        completion_tokens: response.usageMetadata?.candidatesTokenCount || 0,
-        total_tokens: response.usageMetadata?.totalTokenCount || 0,
-      },
+      usage,
       system_fingerprint: `fp_${model.replace(/[^a-z0-9]/g, '_')}`,
     };
   }
@@ -282,12 +299,34 @@ export class GeminiProvider implements Provider {
       choice.finish_reason = chunk.candidates[0].finishReason === 'FUNCTION_CALL' ? 'tool_calls' : 'stop';
     }
 
-    return {
+    // Build response object
+    const response: any = {
       id,
       object: 'chat.completion.chunk',
       created,
       model,
       choices: [choice],
     };
+
+    // Add usage information if present in chunk
+    if (chunk.usageMetadata) {
+      const usage: any = {
+        prompt_tokens: chunk.usageMetadata.promptTokenCount || 0,
+        completion_tokens: chunk.usageMetadata.candidatesTokenCount || 0,
+        total_tokens: chunk.usageMetadata.totalTokenCount || 0,
+      };
+      
+      // Add reasoning_tokens from thoughtsTokenCount
+      const thoughtsTokenCount = chunk.usageMetadata.thoughtsTokenCount || 0;
+      if (thoughtsTokenCount > 0) {
+        usage.completion_tokens_details = {
+          reasoning_tokens: thoughtsTokenCount,
+        };
+      }
+      
+      response.usage = usage;
+    }
+
+    return response;
   }
 }

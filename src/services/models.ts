@@ -1,5 +1,6 @@
 import { getConfig } from '../config.js';
 import { getEnabledProviders, getAllEnabledModels } from '../storage/openai-compat.js';
+import { getBaseModelName } from './converter.js';
 
 interface OAuthModelAlias {
   name: string;
@@ -180,7 +181,10 @@ export function getProviderForModel(model: string): string | null {
   }
 
   // Check Gemini (default)
-  const isGeminiModel = isModelSupported(resolved, config.gemini.supportedModels);
+  // Use getBaseModelName to handle thinking suffixes like "-high" or "(high)"
+  const baseModelName = getBaseModelName(resolved);
+  const isGeminiModel = isModelSupported(resolved, config.gemini.supportedModels) || 
+                        isModelSupported(baseModelName, config.gemini.supportedModels);
   if (isGeminiModel && !isModelExcluded(resolved, config.gemini.excludedModels || [])) {
     return 'gemini';
   }
