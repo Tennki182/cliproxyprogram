@@ -12,6 +12,7 @@ import {
   prepareImageGenerationRequest,
   getBaseModelName,
 } from '../converter.js';
+import { resolveModelAlias } from '../models.js';
 
 function generateId(): string {
   return 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
@@ -33,9 +34,10 @@ export class GeminiProvider implements Provider {
   async chatCompletion(model: string, request: any): Promise<any> {
     const backend = this.backendFn();
     
-    // Get base model name (remove thinking suffix like "(8192)" or "-high")
-    // The thinking config is already extracted in convertToGeminiConfig
-    let actualModel = getBaseModelName(model);
+    // Resolve model alias first, then get base model name
+    // This ensures gemini-3.1-pro-high -> gemini-3.1-pro-preview -> gemini-3.1-pro-preview
+    const resolvedModel = resolveModelAlias(model, this.name);
+    let actualModel = getBaseModelName(resolvedModel);
     
     // Handle image generation models
     if (isImageGenerationModel(model)) {
@@ -78,9 +80,10 @@ export class GeminiProvider implements Provider {
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
     const backend = this.backendFn();
     
-    // Get base model name (remove thinking suffix like "(8192)" or "-high")
-    // The thinking config is already extracted in convertToGeminiConfig
-    let actualModel = getBaseModelName(model);
+    // Resolve model alias first, then get base model name
+    // This ensures gemini-3.1-pro-high -> gemini-3.1-pro-preview -> gemini-3.1-pro-preview
+    const resolvedModel = resolveModelAlias(model, this.name);
+    let actualModel = getBaseModelName(resolvedModel);
     
     // Handle image generation models
     if (isImageGenerationModel(model)) {
