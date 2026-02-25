@@ -11,6 +11,7 @@ import {
   GeminiToolConfig,
   GeminiFunctionResponsePart,
   GeminiThinkingConfig,
+  GeminiSystemInstruction,
 } from '../types/gemini.js';
 import { normalizeFunctionName } from './pinyin.js';
 import { logWarn, logInfo } from './log-stream.js';
@@ -182,10 +183,13 @@ export function convertMessagesToContents(
           }
           
           // Decode tool ID in case it has encoded signature from previous turn
-          const { signature } = decodeToolIdAndSignature(toolCall.id);
+          const { toolId, signature } = decodeToolIdAndSignature(toolCall.id);
+          // Use original tool ID or generate a new one
+          const callId = toolId || toolCall.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           
           const part: any = {
             functionCall: {
+              id: callId,
               name: normalizedName,
               args,
             },
@@ -228,20 +232,93 @@ export function convertMessagesToContents(
     }
   }
 
-  return contents;
+  // Clean up contents: filter empty parts and fix text field types
+  const cleanedContents: GeminiContent[] = [];
+  for (const content of contents) {
+    if (!content.parts || !Array.isArray(content.parts)) continue;
+    
+    const validParts: any[] = [];
+    for (const part of content.parts) {
+      if (!part || typeof part !== 'object') continue;
+      
+      const p = part as any;  // Cast to any for flexible property access
+      
+      // Check if part has valid non-empty value
+      let hasValidValue = false;
+      
+      // Check text field
+      if (typeof p.text === 'string' && p.text.trim()) {
+        hasValidValue = true;
+      }
+      // Check inlineData field
+      else if (p.inlineData && typeof p.inlineData === 'object' && 
+               p.inlineData.data && p.inlineData.mimeType) {
+        hasValidValue = true;
+      }
+      // Check functionCall field
+      else if (p.functionCall && typeof p.functionCall === 'object' && p.functionCall.name) {
+        hasValidValue = true;
+      }
+      // Check functionResponse field
+      else if (p.functionResponse && typeof p.functionResponse === 'object' && p.functionResponse.name) {
+        hasValidValue = true;
+      }
+      // Check thought field (valid even if empty)
+      else if (p.thought !== undefined || p.thoughtSignature !== undefined) {
+        hasValidValue = true;
+      }
+      
+      if (!hasValidValue) continue;
+      
+      const cleanedPart = { ...part };
+      
+      // Fix text field: ensure it's a string, not a list
+      if ('text' in cleanedPart) {
+        const textValue = cleanedPart.text;
+        if (Array.isArray(textValue)) {
+          cleanedPart.text = (textValue as string[]).filter(t => t).join(' ');
+        } else if (typeof textValue !== 'string') {
+          cleanedPart.text = String(textValue);
+        }
+        // Trim trailing whitespace
+        if (typeof cleanedPart.text === 'string') {
+          cleanedPart.text = cleanedPart.text.trimEnd();
+        }
+      }
+      
+      validParts.push(cleanedPart);
+    }
+    
+    if (validParts.length > 0) {
+      cleanedContents.push({
+        role: content.role,
+        parts: validParts,
+      });
+    }
+  }
+  
+  // Handle empty contents: add default user message
+  if (cleanedContents.length === 0) {
+    cleanedContents.push({
+      role: 'user',
+      parts: [{ text: '请根据系统指令回答。' }],
+    });
+  }
+
+  return cleanedContents;
 }
 
 /**
  * Extract system instruction from messages if present
+ * Note: Gemini systemInstruction only has parts, no role field
  */
 export function extractSystemInstruction(
   messages: OpenAIMessage[]
-): GeminiContent | undefined {
+): GeminiSystemInstruction | undefined {
   const systemMsg = messages.find((m) => m.role === 'system');
   if (!systemMsg) return undefined;
 
   return {
-    role: 'user',
     parts: convertContentToParts(systemMsg.content),
   };
 }

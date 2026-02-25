@@ -3,6 +3,7 @@ import {
   GeminiGenerationConfig,
   GeminiTool,
   GeminiToolConfig,
+  GeminiSystemInstruction,
 } from '../types/gemini.js';
 
 /**
@@ -16,7 +17,7 @@ export interface Backend {
   generateContent(
     modelName: string,
     contents: GeminiContent[],
-    systemInstruction?: GeminiContent,
+    systemInstruction?: GeminiSystemInstruction,
     generationConfig?: GeminiGenerationConfig,
     tools?: GeminiTool[],
     toolConfig?: GeminiToolConfig,
@@ -25,7 +26,7 @@ export interface Backend {
   generateContentStream(
     modelName: string,
     contents: GeminiContent[],
-    systemInstruction?: GeminiContent,
+    systemInstruction?: GeminiSystemInstruction,
     generationConfig?: GeminiGenerationConfig,
     tools?: GeminiTool[],
     toolConfig?: GeminiToolConfig,

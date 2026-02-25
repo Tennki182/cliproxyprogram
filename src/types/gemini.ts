@@ -85,12 +85,17 @@ export interface GeminiToolConfig {
   };
 }
 
+// Gemini systemInstruction only has parts, no role field
+export interface GeminiSystemInstruction {
+  parts: GeminiPart[];
+}
+
 export interface GeminiGenerateContentRequest {
   contents: GeminiContent[];
   generationConfig?: GeminiGenerationConfig;
   tools?: GeminiTool[];
   toolConfig?: GeminiToolConfig;
-  systemInstruction?: GeminiContent;
+  systemInstruction?: GeminiSystemInstruction;
   safetySettings?: unknown[];
 }
 

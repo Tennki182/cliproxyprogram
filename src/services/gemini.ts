@@ -3,6 +3,7 @@ import {
   GeminiGenerationConfig,
   GeminiTool,
   GeminiToolConfig,
+  GeminiSystemInstruction,
 } from '../types/gemini.js';
 import { getConfig } from '../config.js';
 import { pfetch } from './http.js';
@@ -596,7 +597,7 @@ function buildRequestBody(
   modelName: string,
   _projectId: string,  // project is now added dynamically via fastUpdateCredential
   contents: GeminiContent[],
-  systemInstruction?: GeminiContent,
+  systemInstruction?: GeminiSystemInstruction,
   generationConfig?: GeminiGenerationConfig,
   tools?: GeminiTool[],
   toolConfig?: GeminiToolConfig
@@ -607,7 +608,21 @@ function buildRequestBody(
   };
 
   if (generationConfig) {
-    innerRequest.generationConfig = generationConfig;
+    // Normalize generation config: force optimal defaults
+    const normalizedConfig = { ...generationConfig };
+    // Force maxOutputTokens to 64000 only if not set or too small
+    if (!normalizedConfig.maxOutputTokens || normalizedConfig.maxOutputTokens < 1000) {
+      normalizedConfig.maxOutputTokens = 64000;
+    }
+    // Force topK to 64 for better diversity
+    normalizedConfig.topK = 64;
+    innerRequest.generationConfig = normalizedConfig;
+  } else {
+    // Add default generation config with optimal settings
+    innerRequest.generationConfig = {
+      maxOutputTokens: 64000,
+      topK: 64,
+    };
   }
   if (tools && tools.length > 0) {
     innerRequest.tools = tools;
@@ -621,7 +636,7 @@ function buildRequestBody(
 
   return {
     model: modelName,
-    // project will be added dynamically by fastUpdateCredential
+    // project will be added dynamically via fastUpdateCredential
     request: innerRequest,
   };
 }
@@ -641,7 +656,7 @@ function unwrapResponse(data: any): any {
 export async function generateContent(
   modelName: string,
   contents: GeminiContent[],
-  systemInstruction?: GeminiContent,
+  systemInstruction?: GeminiSystemInstruction,
   generationConfig?: GeminiGenerationConfig,
   tools?: GeminiTool[],
   toolConfig?: GeminiToolConfig
@@ -657,7 +672,7 @@ export async function generateContent(
 export async function generateContentStream(
   modelName: string,
   contents: GeminiContent[],
-  systemInstruction?: GeminiContent,
+  systemInstruction?: GeminiSystemInstruction,
   generationConfig?: GeminiGenerationConfig,
   tools?: GeminiTool[],
   toolConfig?: GeminiToolConfig
@@ -685,7 +700,7 @@ export class CloudCodeBackend implements Backend {
   generateContent(
     modelName: string,
     contents: GeminiContent[],
-    systemInstruction?: GeminiContent,
+    systemInstruction?: GeminiSystemInstruction,
     generationConfig?: GeminiGenerationConfig,
     tools?: GeminiTool[],
     toolConfig?: GeminiToolConfig,
@@ -696,7 +711,7 @@ export class CloudCodeBackend implements Backend {
   generateContentStream(
     modelName: string,
     contents: GeminiContent[],
-    systemInstruction?: GeminiContent,
+    systemInstruction?: GeminiSystemInstruction,
     generationConfig?: GeminiGenerationConfig,
     tools?: GeminiTool[],
     toolConfig?: GeminiToolConfig,
