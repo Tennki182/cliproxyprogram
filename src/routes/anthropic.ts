@@ -96,12 +96,10 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
             },
           })}\n\n`);
 
-          // Send content_block_start
-          reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
-            type: 'content_block_start',
-            index: 0,
-            content_block: { type: 'text', text: '' },
-          })}\n\n`);
+          // Track if we've started a thinking block
+          let thinkingBlockStarted = false;
+          let textBlockStarted = false;
+          let currentBlockIndex = 0;
 
           // Keep-alive - Anthropic uses ping events
           const clearKeepAlive = createSSEKeepAlive(reply, 15000, `event: ping\ndata: {}\n\n`);
@@ -112,11 +110,52 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
           try {
             for await (const chunk of stream) {
               const choice = chunk.choices?.[0];
-              const text = choice?.delta?.content;
-              if (text) {
+
+              // Handle reasoning_content (thinking)
+              const reasoningContent = choice?.delta?.reasoning_content;
+              if (reasoningContent) {
+                // Start thinking block if not started
+                if (!thinkingBlockStarted) {
+                  reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: currentBlockIndex,
+                    content_block: { type: 'thinking', thinking: '' },
+                  })}\n\n`);
+                  thinkingBlockStarted = true;
+                }
                 reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
                   type: 'content_block_delta',
-                  index: 0,
+                  index: currentBlockIndex,
+                  delta: { type: 'thinking_delta', thinking: reasoningContent },
+                })}\n\n`);
+              }
+
+              // Handle text content
+              const text = choice?.delta?.content;
+              if (text) {
+                // Close thinking block if we were in one and now getting text
+                if (thinkingBlockStarted && !textBlockStarted) {
+                  reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                    type: 'content_block_stop',
+                    index: currentBlockIndex,
+                  })}\n\n`);
+                  currentBlockIndex++;
+                  thinkingBlockStarted = false;
+                }
+
+                // Start text block if not started
+                if (!textBlockStarted) {
+                  reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: currentBlockIndex,
+                    content_block: { type: 'text', text: '' },
+                  })}\n\n`);
+                  textBlockStarted = true;
+                }
+
+                reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                  type: 'content_block_delta',
+                  index: currentBlockIndex,
                   delta: { type: 'text_delta', text },
                 })}\n\n`);
               }
@@ -126,14 +165,26 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
                 for (const tc of choice.delta.tool_calls) {
                   const tcIndex = tc.index ?? 0;
                   if (!toolCallBuffers.has(tcIndex)) {
-                    // New tool call — close text block, start tool_use block
-                    if (contentBlockIndex === 0) {
+                    // Close thinking block if open
+                    if (thinkingBlockStarted) {
                       reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
                         type: 'content_block_stop',
-                        index: 0,
+                        index: currentBlockIndex,
                       })}\n\n`);
+                      currentBlockIndex++;
+                      thinkingBlockStarted = false;
                     }
-                    contentBlockIndex++;
+                    // Close text block if open
+                    if (textBlockStarted) {
+                      reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                        type: 'content_block_stop',
+                        index: currentBlockIndex,
+                      })}\n\n`);
+                      currentBlockIndex++;
+                      textBlockStarted = false;
+                    }
+
+                    // New tool call — start tool_use block
                     toolCallBuffers.set(tcIndex, {
                       id: tc.id || `toolu_${Date.now()}_${tcIndex}`,
                       name: tc.function?.name || '',
@@ -141,7 +192,7 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
                     });
                     reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
                       type: 'content_block_start',
-                      index: contentBlockIndex,
+                      index: currentBlockIndex,
                       content_block: {
                         type: 'tool_use',
                         id: toolCallBuffers.get(tcIndex)!.id,
@@ -149,6 +200,8 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
                         input: {},
                       },
                     })}\n\n`);
+                    contentBlockIndex = currentBlockIndex;
+                    currentBlockIndex++;
                   }
                   // Accumulate arguments delta
                   const buf = toolCallBuffers.get(tcIndex)!;
@@ -170,21 +223,31 @@ export async function anthropicRoutes(fastify: FastifyInstance): Promise<void> {
             clearKeepAlive();
           }
 
-          // Close any open tool_use blocks
-          for (const [_tcIdx] of toolCallBuffers) {
-            contentBlockIndex++;
+          // Close thinking block if still open
+          if (thinkingBlockStarted) {
             reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
               type: 'content_block_stop',
-              index: contentBlockIndex - 1,
+              index: currentBlockIndex,
             })}\n\n`);
+            currentBlockIndex++;
           }
 
-          // If no tool calls were emitted, close the text block
-          if (toolCallBuffers.size === 0) {
+          // Close text block if still open
+          if (textBlockStarted) {
             reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
               type: 'content_block_stop',
-              index: 0,
+              index: currentBlockIndex,
             })}\n\n`);
+            currentBlockIndex++;
+          }
+
+          // Close any open tool_use blocks
+          for (const [_tcIdx] of toolCallBuffers) {
+            reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
+              type: 'content_block_stop',
+              index: contentBlockIndex,
+            })}\n\n`);
+            contentBlockIndex++;
           }
 
           const stopReason = toolCallBuffers.size > 0 ? 'tool_use' : 'end_turn';
@@ -313,6 +376,11 @@ function openaiToAnthropic(model: string, openai: any): any {
   const choice = openai.choices?.[0];
   const content: any[] = [];
 
+  // Add thinking block for reasoning_content (extended thinking)
+  if (choice?.message?.reasoning_content) {
+    content.push({ type: 'thinking', thinking: choice.message.reasoning_content });
+  }
+
   if (choice?.message?.content) {
     content.push({ type: 'text', text: choice.message.content });
   }
@@ -329,6 +397,9 @@ function openaiToAnthropic(model: string, openai: any): any {
 
   const stopReason = choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn';
 
+  // Include reasoning_tokens in output_tokens if available
+  const reasoningTokens = openai.usage?.completion_tokens_details?.reasoning_tokens || 0;
+
   return {
     id: openai.id || `msg_${Math.random().toString(36).substring(2, 15)}`,
     type: 'message',
@@ -339,7 +410,17 @@ function openaiToAnthropic(model: string, openai: any): any {
     stop_sequence: null,
     usage: {
       input_tokens: openai.usage?.prompt_tokens || 0,
-      output_tokens: openai.usage?.completion_tokens || 0,
+      output_tokens: (openai.usage?.completion_tokens || 0),
+      // Add cache read/write tokens if present (for extended thinking)
+      ...(openai.usage?.prompt_tokens_details?.cached_tokens ? { cache_read_input_tokens: openai.usage.prompt_tokens_details.cached_tokens } : {}),
     },
+    // Add extended thinking usage if present
+    ...(reasoningTokens > 0 ? {
+      _debug: {
+        usage: {
+          reasoning_tokens: reasoningTokens,
+        },
+      },
+    } : {}),
   };
 }

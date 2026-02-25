@@ -102,6 +102,10 @@ const ConfigSchema = z.object({
     apiKey: z.string(),
     loginSecret: z.string(),
   })),
+  // 控制是否将思维链返回到前端
+  // 启用后，思维链会在响应的 reasoning_content 字段中返回
+  // 禁用后，思维链会在响应中被过滤掉
+  returnThoughtsToFrontend: z.boolean().default(true),
   storage: z.object({
     type: z.string(),
     path: z.string(),

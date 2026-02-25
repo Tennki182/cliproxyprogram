@@ -7,6 +7,11 @@ auth:
 storage:
   type: sqlite
   path: ./data/proxycli.db
+# 控制是否将思维链返回到前端
+# 启用后，思维链会在响应的 reasoning_content 字段中返回
+# 禁用后，思维链会在响应中被过滤掉
+# 默认值: true
+returnThoughtsToFrontend: true
 gemini:
   defaultModel: gemini-2.5-flash
   apiEndpoint: https://cloudcode-pa.googleapis.com/v1internal

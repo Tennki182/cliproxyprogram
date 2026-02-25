@@ -14,6 +14,7 @@ import {
 } from '../types/gemini.js';
 import { normalizeFunctionName } from './pinyin.js';
 import { logWarn, logInfo } from './log-stream.js';
+import { getConfig } from '../config.js';
 
 export interface ConvertOptions {
   includeThoughtSignature?: boolean;
@@ -590,30 +591,77 @@ export function convertToGeminiConfig(
 
   // Convert reasoning_effort or thinking_budget to thinkingConfig
   // First check explicit settings, then parse from model name
+  // 
+  // includeThoughts logic (reference: gcli2api normalize_gemini_request):
+  // 1. For pro models: includeThoughts = returnThoughtsToFrontend (config)
+  // 2. For Gemini 3 flash: if no thinkingLevel set, includeThoughts = false
+  // 3. For Gemini 2.5 flash: if no thinkingBudget set, don't add thinkingConfig
+  // 4. For other cases: includeThoughts based on whether budget/level is set and not 0/none
+  
+  const returnThoughtsToFrontend = getConfig().returnThoughtsToFrontend ?? true;
+  const baseModel = getBaseModelName(request.model).toLowerCase();
+  const isProModel = baseModel.includes('pro');
+  const isFlashModel = baseModel.includes('flash');
+  const isGemini3 = baseModel.includes('gemini-3');
+  const isGemini25 = baseModel.includes('gemini-2.5');
+  
   if (request.thinking_budget !== undefined) {
     // Direct thinking budget takes precedence
     config.thinkingConfig = {
       thinkingBudget: request.thinking_budget,
-      includeThoughts: request.thinking_budget !== 0,
+      includeThoughts: request.thinking_budget !== 0 && returnThoughtsToFrontend,
     };
   } else if (request.reasoning_effort !== undefined) {
-    config.thinkingConfig = convertReasoningEffort(request.reasoning_effort);
+    const effortConfig = convertReasoningEffort(request.reasoning_effort);
+    if (effortConfig) {
+      // Override includeThoughts based on config for non-'none' efforts
+      if (request.reasoning_effort !== 'none') {
+        effortConfig.includeThoughts = returnThoughtsToFrontend;
+      }
+      config.thinkingConfig = effortConfig;
+    }
   } else {
     // Parse thinking settings from model name
     const modelThinkingSettings = getThinkingSettingsFromModel(request.model);
     if (modelThinkingSettings) {
-      // Determine includeThoughts based on budget/level
-      let includeThoughts = true;
-      if (modelThinkingSettings.thinkingBudget === 0) {
-        includeThoughts = false;
-      } else if (modelThinkingSettings.thinkingLevel === 'none') {
-        includeThoughts = false;
+      // Determine includeThoughts based on model type and settings
+      let includeThoughts: boolean;
+      
+      if (isProModel) {
+        // Pro models: use config setting
+        includeThoughts = returnThoughtsToFrontend;
+      } else if (isGemini3 && isFlashModel) {
+        // Gemini 3 flash: only include thoughts if thinkingLevel is set
+        includeThoughts = modelThinkingSettings.thinkingLevel != null 
+          ? returnThoughtsToFrontend 
+          : false;
+      } else if (isGemini25 && isFlashModel) {
+        // Gemini 2.5 flash: only include thoughts if thinkingBudget is set and > 0
+        includeThoughts = modelThinkingSettings.thinkingBudget != null && 
+          modelThinkingSettings.thinkingBudget > 0 
+          ? returnThoughtsToFrontend 
+          : false;
+      } else {
+        // Other models: use default logic
+        if (modelThinkingSettings.thinkingBudget === 0) {
+          includeThoughts = false;
+        } else if (modelThinkingSettings.thinkingLevel === 'none') {
+          includeThoughts = false;
+        } else {
+          includeThoughts = returnThoughtsToFrontend;
+        }
       }
       
       config.thinkingConfig = {
         thinkingBudget: modelThinkingSettings.thinkingBudget,
         thinkingLevel: modelThinkingSettings.thinkingLevel as any,
         includeThoughts,
+      };
+    } else if (isProModel) {
+      // Pro model without explicit thinking settings: still enable thinking with default
+      // This ensures pro models always have thinkingConfig to return thoughts
+      config.thinkingConfig = {
+        includeThoughts: returnThoughtsToFrontend,
       };
     }
   }
