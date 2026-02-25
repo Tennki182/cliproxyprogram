@@ -210,9 +210,11 @@ export function listAllModels(options?: { includeExcluded?: boolean }): Array<{ 
     }
   }
 
-  // Add Gemini aliases
+  // Add Gemini aliases (avoid duplicates with supportedModels)
   for (const alias of Object.keys(config.gemini.modelAliases)) {
-    models.push({ id: `gemini/${alias}`, provider: 'gemini', owned_by: 'google' });
+    if (!config.gemini.supportedModels.includes(alias)) {
+      models.push({ id: `gemini/${alias}`, provider: 'gemini', owned_by: 'google' });
+    }
   }
 
   // Codex models
@@ -224,7 +226,9 @@ export function listAllModels(options?: { includeExcluded?: boolean }): Array<{ 
       }
     }
     for (const alias of Object.keys(config.codex.modelAliases)) {
-      models.push({ id: `codex/${alias}`, provider: 'codex', owned_by: 'openai' });
+      if (!config.codex.supportedModels.includes(alias)) {
+        models.push({ id: `codex/${alias}`, provider: 'codex', owned_by: 'openai' });
+      }
     }
   }
 
@@ -237,7 +241,9 @@ export function listAllModels(options?: { includeExcluded?: boolean }): Array<{ 
       }
     }
     for (const alias of Object.keys(config.iflow.modelAliases)) {
-      models.push({ id: `iflow/${alias}`, provider: 'iflow', owned_by: 'iflow' });
+      if (!config.iflow.supportedModels.includes(alias)) {
+        models.push({ id: `iflow/${alias}`, provider: 'iflow', owned_by: 'iflow' });
+      }
     }
   }
 
@@ -281,21 +287,27 @@ export function getModelsForProvider(providerName: string): Array<{ id: string; 
       models.push({ id: `gemini/${m}`, name: m });
     }
     for (const [alias, name] of Object.entries(config.gemini.modelAliases)) {
-      models.push({ id: `gemini/${alias}`, name, alias });
+      if (!config.gemini.supportedModels.includes(alias)) {
+        models.push({ id: `gemini/${alias}`, name, alias });
+      }
     }
   } else if (providerName === 'codex' && config.codex.enabled) {
     for (const m of config.codex.supportedModels) {
       models.push({ id: `codex/${m}`, name: m });
     }
     for (const [alias, name] of Object.entries(config.codex.modelAliases)) {
-      models.push({ id: `codex/${alias}`, name, alias });
+      if (!config.codex.supportedModels.includes(alias)) {
+        models.push({ id: `codex/${alias}`, name, alias });
+      }
     }
   } else if (providerName === 'iflow' && config.iflow.enabled) {
     for (const m of config.iflow.supportedModels) {
       models.push({ id: `iflow/${m}`, name: m });
     }
     for (const [alias, name] of Object.entries(config.iflow.modelAliases)) {
-      models.push({ id: `iflow/${alias}`, name, alias });
+      if (!config.iflow.supportedModels.includes(alias)) {
+        models.push({ id: `iflow/${alias}`, name, alias });
+      }
     }
   }
 
