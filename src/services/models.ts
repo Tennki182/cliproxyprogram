@@ -258,7 +258,24 @@ export function listAllModels(options?: { includeExcluded?: boolean }): Array<{ 
     });
   }
 
-  return models;
+  // Deduplicate models based on base model name to avoid semantic duplicates
+  // e.g., "gemini-3.1-pro-high" and "gemini-3.1-pro(high)" are the same model
+  const seenBaseNames = new Set<string>();
+  const dedupedModels: typeof models = [];
+  
+  for (const m of models) {
+    // Extract model name (remove provider/ prefix)
+    const modelName = m.id.includes('/') ? m.id.split('/').slice(1).join('/') : m.id;
+    const baseName = getBaseModelName(modelName);
+    const key = `${m.provider}/${baseName}`;
+    
+    if (!seenBaseNames.has(key)) {
+      seenBaseNames.add(key);
+      dedupedModels.push(m);
+    }
+  }
+
+  return dedupedModels;
 }
 
 /**
@@ -311,5 +328,19 @@ export function getModelsForProvider(providerName: string): Array<{ id: string; 
     }
   }
 
-  return models;
+  // Deduplicate models based on base model name
+  const seenBaseNames = new Set<string>();
+  const dedupedModels: typeof models = [];
+  
+  for (const m of models) {
+    const modelName = m.id.includes('/') ? m.id.split('/').slice(1).join('/') : m.id;
+    const baseName = getBaseModelName(modelName);
+    
+    if (!seenBaseNames.has(baseName)) {
+      seenBaseNames.add(baseName);
+      dedupedModels.push(m);
+    }
+  }
+
+  return dedupedModels;
 }
