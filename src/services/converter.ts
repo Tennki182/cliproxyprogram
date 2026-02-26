@@ -9,7 +9,6 @@ import {
   GeminiFunctionDeclaration,
   GeminiTool,
   GeminiToolConfig,
-  GeminiFunctionResponsePart,
   GeminiThinkingConfig,
   GeminiSystemInstruction,
 } from '../types/gemini.js';
@@ -77,17 +76,17 @@ function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string
  */
 function parseDataUrl(url: string): { mimeType: string; data: string } | null {
   if (!url.startsWith('data:')) return null;
-  
+
   const commaIndex = url.indexOf(',');
   if (commaIndex === -1) return null;
-  
+
   const header = url.substring(5, commaIndex);
   const data = url.substring(commaIndex + 1);
-  
+
   // Parse mime type from header (e.g., "image/png;base64")
   const semiIndex = header.indexOf(';');
   const mimeType = semiIndex !== -1 ? header.substring(0, semiIndex) : header;
-  
+
   return { mimeType, data };
 }
 
@@ -99,11 +98,11 @@ function convertContentToParts(content: OpenAIMessageContent): any[] {
   if (typeof content === 'string') {
     return [{ text: content }];
   }
-  
+
   // Array content (multimodal)
   if (Array.isArray(content)) {
     const parts: any[] = [];
-    
+
     for (const item of content) {
       if (item.type === 'text') {
         parts.push({ text: item.text });
@@ -119,10 +118,10 @@ function convertContentToParts(content: OpenAIMessageContent): any[] {
         }
       }
     }
-    
+
     return parts;
   }
-  
+
   return [];
 }
 
@@ -135,16 +134,36 @@ export function convertMessagesToContents(
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
   const includeThought = options?.includeThoughtSignature ?? true;
-  
+
   // Process thinking blocks: filter invalid ones and sanitize
   const processedMessages = processThinkingBlocks(messages);
-  
+
   // Build tool_call_id -> function name mapping for tool responses
   const toolCallIdToName = buildToolCallIdToNameMap(processedMessages);
 
+  // Track whether we've passed the leading system messages
+  // Leading system messages are extracted by extractSystemInstruction separately
+  // Non-leading system messages should be converted to user messages (reference: gcli2api)
+  let pastLeadingSystem = false;
+
   for (const msg of processedMessages) {
-    // Skip system messages - Gemini uses systemInstruction separately
-    if (msg.role === 'system') continue;
+    // Handle system messages
+    if (msg.role === 'system') {
+      if (!pastLeadingSystem) {
+        // Skip leading system messages - handled by extractSystemInstruction
+        continue;
+      }
+      // Non-leading system messages: convert to user messages to preserve context
+      // SillyTavern and other frontends may insert system messages throughout the conversation
+      contents.push({
+        role: 'user',
+        parts: convertContentToParts(msg.content),
+      });
+      continue;
+    }
+
+    // Once we encounter a non-system message, we're past leading system messages
+    pastLeadingSystem = true;
 
     if (msg.role === 'user') {
       contents.push({
@@ -172,21 +191,21 @@ export function convertMessagesToContents(
           } catch {
             args = {};
           }
-          
+
           // Normalize function name for Gemini API compatibility
           const normalizedName = normalizeFunctionName(toolCall.function.name);
-          
+
           // Fix argument types based on cached tool schema
           const toolSchema = getToolSchema(normalizedName);
           if (toolSchema) {
             args = fixToolCallArgsTypes(args, toolSchema);
           }
-          
+
           // Decode tool ID in case it has encoded signature from previous turn
           const { toolId, signature } = decodeToolIdAndSignature(toolCall.id);
           // Use original tool ID or generate a new one
           const callId = toolId || toolCall.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          
+
           const part: any = {
             functionCall: {
               id: callId,
@@ -194,12 +213,12 @@ export function convertMessagesToContents(
               args,
             },
           };
-          
+
           if (includeThought) {
             // Use existing signature from decoded ID or generate new one
             part.thoughtSignature = signature || 'skip_thought_signature_validator';
           }
-          
+
           parts.push(part);
         }
       }
@@ -214,19 +233,32 @@ export function convertMessagesToContents(
       // Decode in case it has encoded signature
       const { toolId } = decodeToolIdAndSignature(toolCallId);
       const functionName = toolId ? (toolCallIdToName.get(toolId) || (msg as any).name) : (msg as any).name;
-      
+
       // Normalize function name
       const normalizedName = functionName ? normalizeFunctionName(functionName) : '';
-      
+
+      // Parse response data - try JSON first, fall back to wrapping as object
+      // (reference: gcli2api - ensures response is always a dict/object)
+      let responseData: Record<string, unknown>;
+      try {
+        const parsed = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
+        responseData = (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
+          ? parsed
+          : { result: parsed };
+      } catch {
+        responseData = { result: msg.content };
+      }
+
       contents.push({
         role: 'user',
         parts: [
           {
             functionResponse: {
+              id: toolId || toolCallId,
               name: normalizedName,
-              response: { result: msg.content },
+              response: responseData,
             },
-          } as GeminiFunctionResponsePart,
+          } as any,
         ],
       });
     }
@@ -236,23 +268,23 @@ export function convertMessagesToContents(
   const cleanedContents: GeminiContent[] = [];
   for (const content of contents) {
     if (!content.parts || !Array.isArray(content.parts)) continue;
-    
+
     const validParts: any[] = [];
     for (const part of content.parts) {
       if (!part || typeof part !== 'object') continue;
-      
+
       const p = part as any;  // Cast to any for flexible property access
-      
+
       // Check if part has valid non-empty value
       let hasValidValue = false;
-      
+
       // Check text field
       if (typeof p.text === 'string' && p.text.trim()) {
         hasValidValue = true;
       }
       // Check inlineData field
-      else if (p.inlineData && typeof p.inlineData === 'object' && 
-               p.inlineData.data && p.inlineData.mimeType) {
+      else if (p.inlineData && typeof p.inlineData === 'object' &&
+        p.inlineData.data && p.inlineData.mimeType) {
         hasValidValue = true;
       }
       // Check functionCall field
@@ -267,11 +299,11 @@ export function convertMessagesToContents(
       else if (p.thought !== undefined || p.thoughtSignature !== undefined) {
         hasValidValue = true;
       }
-      
+
       if (!hasValidValue) continue;
-      
+
       const cleanedPart = { ...part };
-      
+
       // Fix text field: ensure it's a string, not a list
       if ('text' in cleanedPart) {
         const textValue = cleanedPart.text;
@@ -285,10 +317,10 @@ export function convertMessagesToContents(
           cleanedPart.text = cleanedPart.text.trimEnd();
         }
       }
-      
+
       validParts.push(cleanedPart);
     }
-    
+
     if (validParts.length > 0) {
       cleanedContents.push({
         role: content.role,
@@ -296,7 +328,7 @@ export function convertMessagesToContents(
       });
     }
   }
-  
+
   // Handle empty contents: add default user message
   if (cleanedContents.length === 0) {
     cleanedContents.push({
@@ -305,21 +337,55 @@ export function convertMessagesToContents(
     });
   }
 
-  return cleanedContents;
+  // Merge consecutive same-role messages
+  // Gemini API forbids consecutive contents with the same role
+  // SillyTavern often produces this pattern (e.g., user→system-as-user→user)
+  const mergedContents: GeminiContent[] = [];
+  for (const content of cleanedContents) {
+    const last = mergedContents[mergedContents.length - 1];
+    if (last && last.role === content.role) {
+      // Merge parts into the last content of the same role
+      last.parts = [...last.parts, ...content.parts];
+    } else {
+      mergedContents.push({ ...content, parts: [...content.parts] });
+    }
+  }
+
+  return mergedContents;
 }
 
 /**
  * Extract system instruction from messages if present
+ * Merges all consecutive system messages into a single systemInstruction
  * Note: Gemini systemInstruction only has parts, no role field
+ * 
+ * Reference: gcli2api merge_system_messages
  */
 export function extractSystemInstruction(
   messages: OpenAIMessage[]
 ): GeminiSystemInstruction | undefined {
-  const systemMsg = messages.find((m) => m.role === 'system');
-  if (!systemMsg) return undefined;
+  const systemParts: any[] = [];
+  let collectingSystem = true;
+
+  for (const msg of messages) {
+    if (msg.role === 'system' && collectingSystem) {
+      // Extract text content from system message
+      const parts = convertContentToParts(msg.content);
+      for (const part of parts) {
+        if (part.text && part.text.trim()) {
+          systemParts.push(part);
+        }
+      }
+    } else if (msg.role !== 'system') {
+      // Stop collecting when encountering non-system message
+      collectingSystem = false;
+    }
+  }
+
+  if (systemParts.length === 0) return undefined;
 
   return {
-    parts: convertContentToParts(systemMsg.content),
+    parts: systemParts,
   };
 }
 
@@ -338,15 +404,15 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
   if (suffixResult.hasSuffix) {
     return suffixResult.config;
   }
-  
+
   // Fallback to hyphen suffix format
   const lowerModel = modelName.toLowerCase();
-  
+
   // Check for thinking-related suffixes
   const isGemini25 = lowerModel.includes('gemini-2.5');
   const isGemini3 = lowerModel.includes('gemini-3');
   const isFlash = lowerModel.includes('flash');
-  
+
   // Handle old-style suffixes
   if (lowerModel.includes('-nothinking')) {
     if (isFlash) {
@@ -354,7 +420,7 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
     }
     return { thinkingBudget: 128 };
   }
-  
+
   if (lowerModel.includes('-maxthinking')) {
     if (isGemini3) {
       return { thinkingLevel: 'high' };
@@ -362,7 +428,7 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
     const budget = isFlash ? 24576 : 32768;
     return { thinkingBudget: budget };
   }
-  
+
   // Handle new-style budget/level suffixes
   if (lowerModel.includes('-max')) {
     if (isGemini25) {
@@ -372,7 +438,7 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
       return { thinkingLevel: 'high' };
     }
   }
-  
+
   if (lowerModel.includes('-high')) {
     if (isGemini25) {
       return { thinkingBudget: 16000 };
@@ -380,7 +446,7 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
       return { thinkingLevel: 'high' };
     }
   }
-  
+
   if (lowerModel.includes('-medium')) {
     if (isGemini25) {
       return { thinkingBudget: 8192 };
@@ -396,14 +462,14 @@ export function getThinkingSettingsFromModel(modelName: string): { thinkingBudge
       return { thinkingLevel: 'low' };
     }
   }
-  
+
   if (lowerModel.includes('-minimal')) {
     if (isGemini25) {
       const budget = isFlash ? 0 : 128;
       return { thinkingBudget: budget };
     }
   }
-  
+
   return null;
 }
 
@@ -423,23 +489,23 @@ function parseThinkingSuffix(modelName: string): { hasSuffix: boolean; config: {
   if (lastOpen === -1) {
     return { hasSuffix: false, config: null };
   }
-  
+
   // Check if the string ends with a closing parenthesis
   if (!modelName.endsWith(')')) {
     return { hasSuffix: false, config: null };
   }
-  
+
   // Extract components
   const baseModel = modelName.substring(0, lastOpen);
   const rawSuffix = modelName.substring(lastOpen + 1, modelName.length - 1);
-  
+
   if (!rawSuffix) {
     return { hasSuffix: false, config: null };
   }
-  
+
   // Parse suffix value
   const lowerSuffix = rawSuffix.toLowerCase();
-  
+
   // 1. Special values: 'none', 'auto', '-1'
   if (lowerSuffix === 'none') {
     return {
@@ -447,14 +513,14 @@ function parseThinkingSuffix(modelName: string): { hasSuffix: boolean; config: {
       config: { thinkingBudget: 0, thinkingLevel: 'none', baseModel },
     };
   }
-  
+
   if (lowerSuffix === 'auto' || lowerSuffix === '-1') {
     return {
       hasSuffix: true,
       config: { thinkingBudget: -1, baseModel },
     };
   }
-  
+
   // 2. Level names: 'minimal', 'low', 'medium', 'high', 'xhigh'
   const levelMap: Record<string, string> = {
     'minimal': 'minimal',
@@ -463,14 +529,14 @@ function parseThinkingSuffix(modelName: string): { hasSuffix: boolean; config: {
     'high': 'high',
     'xhigh': 'xhigh',
   };
-  
+
   if (levelMap[lowerSuffix]) {
     return {
       hasSuffix: true,
       config: { thinkingLevel: levelMap[lowerSuffix], baseModel },
     };
   }
-  
+
   // 3. Numeric budget
   const budget = parseInt(rawSuffix, 10);
   if (!isNaN(budget) && budget >= 0) {
@@ -479,7 +545,7 @@ function parseThinkingSuffix(modelName: string): { hasSuffix: boolean; config: {
       config: { thinkingBudget: budget, baseModel },
     };
   }
-  
+
   // Unknown suffix format
   return { hasSuffix: false, config: null };
 }
@@ -524,7 +590,7 @@ export function getBaseModelName(modelName: string): string {
       return baseModel;
     }
   }
-  
+
   // Fallback to hyphen suffix format
   // Order from longest to shortest to avoid partial matches
   const suffixes = [
@@ -532,10 +598,10 @@ export function getBaseModelName(modelName: string): string {
     '-minimal', '-medium', '-search', '-think',  // Medium length
     '-high', '-max', '-low',  // Short
   ];
-  
+
   let result = modelName;
   let changed = true;
-  
+
   // Keep removing suffixes until no more changes
   while (changed) {
     changed = false;
@@ -546,7 +612,7 @@ export function getBaseModelName(modelName: string): string {
       }
     }
   }
-  
+
   return result;
 }
 
@@ -561,14 +627,14 @@ export function getBaseModelName(modelName: string): string {
  */
 function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'none'): GeminiThinkingConfig | undefined {
   if (!effort) return undefined;
-  
+
   if (effort === 'auto') {
     return {
       thinkingBudget: -1,
       includeThoughts: true,
     };
   }
-  
+
   if (effort === 'none') {
     // For 'none', we need to explicitly disable thinking
     // Use thinkingBudget: 0 for Gemini 2.5, thinkingLevel: 'none' for Gemini 3.x
@@ -579,7 +645,7 @@ function convertReasoningEffort(effort?: 'low' | 'medium' | 'high' | 'auto' | 'n
       includeThoughts: false,
     };
   }
-  
+
   // 'low', 'medium', 'high' - use thinkingLevel
   return {
     thinkingLevel: effort,
@@ -631,8 +697,30 @@ export function convertToGeminiConfig(
     config.topP = request.top_p;
   }
 
-  if (request.max_tokens !== undefined) {
-    config.maxOutputTokens = request.max_tokens;
+  // max_completion_tokens takes priority over max_tokens (reference: gcli2api)
+  // OpenAI newer API uses max_completion_tokens, older uses max_tokens
+  const maxTokens = (request as any).max_completion_tokens ?? request.max_tokens;
+  if (maxTokens !== undefined) {
+    config.maxOutputTokens = maxTokens;
+  }
+
+  // Handle response_format (reference: gcli2api)
+  const responseFormat = (request as any).response_format;
+  if (responseFormat && typeof responseFormat === 'object') {
+    const formatType = responseFormat.type;
+    if (formatType === 'json_schema') {
+      // JSON Schema mode
+      if (responseFormat.json_schema?.schema) {
+        config.responseSchema = cleanSchemaForGemini(responseFormat.json_schema.schema);
+        config.responseMimeType = 'application/json';
+      }
+    } else if (formatType === 'json_object') {
+      // JSON Object mode
+      config.responseMimeType = 'application/json';
+    } else if (formatType === 'text') {
+      // Text mode
+      config.responseMimeType = 'text/plain';
+    }
   }
 
   if (request.stop !== undefined) {
@@ -674,14 +762,14 @@ export function convertToGeminiConfig(
   // 2. For Gemini 3 flash: if no thinkingLevel set, includeThoughts = false
   // 3. For Gemini 2.5 flash: if no thinkingBudget set, don't add thinkingConfig
   // 4. For other cases: includeThoughts based on whether budget/level is set and not 0/none
-  
+
   const returnThoughtsToFrontend = getConfig().returnThoughtsToFrontend ?? true;
   const baseModel = getBaseModelName(request.model).toLowerCase();
   const isProModel = baseModel.includes('pro');
   const isFlashModel = baseModel.includes('flash');
   const isGemini3 = baseModel.includes('gemini-3');
   const isGemini25 = baseModel.includes('gemini-2.5');
-  
+
   if (request.thinking_budget !== undefined) {
     // Direct thinking budget takes precedence
     config.thinkingConfig = {
@@ -703,20 +791,20 @@ export function convertToGeminiConfig(
     if (modelThinkingSettings) {
       // Determine includeThoughts based on model type and settings
       let includeThoughts: boolean;
-      
+
       if (isProModel) {
         // Pro models: use config setting
         includeThoughts = returnThoughtsToFrontend;
       } else if (isGemini3 && isFlashModel) {
         // Gemini 3 flash: only include thoughts if thinkingLevel is set
-        includeThoughts = modelThinkingSettings.thinkingLevel != null 
-          ? returnThoughtsToFrontend 
+        includeThoughts = modelThinkingSettings.thinkingLevel != null
+          ? returnThoughtsToFrontend
           : false;
       } else if (isGemini25 && isFlashModel) {
         // Gemini 2.5 flash: only include thoughts if thinkingBudget is set and > 0
-        includeThoughts = modelThinkingSettings.thinkingBudget != null && 
-          modelThinkingSettings.thinkingBudget > 0 
-          ? returnThoughtsToFrontend 
+        includeThoughts = modelThinkingSettings.thinkingBudget != null &&
+          modelThinkingSettings.thinkingBudget > 0
+          ? returnThoughtsToFrontend
           : false;
       } else {
         // Other models: use default logic
@@ -728,24 +816,39 @@ export function convertToGeminiConfig(
           includeThoughts = returnThoughtsToFrontend;
         }
       }
-      
-      config.thinkingConfig = {
-        thinkingBudget: modelThinkingSettings.thinkingBudget,
-        thinkingLevel: modelThinkingSettings.thinkingLevel as any,
-        includeThoughts,
-      };
+
+      // thinkingBudget and thinkingLevel are mutually exclusive (reference: gcli2api gemini_fix.py)
+      const modelThinkingConfig: GeminiThinkingConfig = { includeThoughts };
+      if (modelThinkingSettings.thinkingBudget !== undefined) {
+        modelThinkingConfig.thinkingBudget = modelThinkingSettings.thinkingBudget;
+        // Don't set thinkingLevel when thinkingBudget is set
+      } else if (modelThinkingSettings.thinkingLevel) {
+        modelThinkingConfig.thinkingLevel = modelThinkingSettings.thinkingLevel as any;
+        // Don't set thinkingBudget when thinkingLevel is set
+      }
+      config.thinkingConfig = modelThinkingConfig;
     } else if (isProModel) {
-      // Pro model without explicit thinking settings: still enable thinking with default
+      // Pro model without explicit thinking settings: enable thinking with default level
       // This ensures pro models always have thinkingConfig to return thoughts
-      config.thinkingConfig = {
-        includeThoughts: returnThoughtsToFrontend,
-      };
+      // For Gemini 3 Pro, set default thinkingLevel; for Gemini 2.5 Pro, no level needed
+      if (isGemini3) {
+        // Gemini 3 Pro: set default thinkingLevel to 'medium'
+        config.thinkingConfig = {
+          thinkingLevel: 'medium',
+          includeThoughts: returnThoughtsToFrontend,
+        };
+      } else {
+        // Gemini 2.5 Pro: just enable includeThoughts
+        config.thinkingConfig = {
+          includeThoughts: returnThoughtsToFrontend,
+        };
+      }
     }
   }
 
   // Convert modalities to responseModalities
   if (request.modalities && request.modalities.length > 0) {
-    config.responseModalities = request.modalities.map(m => 
+    config.responseModalities = request.modalities.map(m =>
       m === 'image' ? 'IMAGE' : 'TEXT'
     );
   }
@@ -781,7 +884,7 @@ export function convertToolsToGemini(
     if (tool?.type === 'function' && tool.function?.name) {
       // Normalize function name for Gemini API compatibility
       const normalizedName = normalizeFunctionName(tool.function.name);
-      
+
       functionDeclarations.push({
         name: normalizedName,
         description: tool.function.description || '',
@@ -800,16 +903,16 @@ export function convertToolsToGemini(
   }
 
   const result: GeminiTool[] = [];
-  
+
   if (functionDeclarations.length > 0) {
     result.push({ functionDeclarations });
   }
-  
+
   // Add special tools (each as separate tool object)
   for (const special of specialTools) {
     result.push(special);
   }
-  
+
   return result.length > 0 ? result : undefined;
 }
 
@@ -820,17 +923,17 @@ function resolveRef(ref: string, rootSchema: Record<string, unknown>): Record<st
   if (!ref.startsWith('#/')) {
     return null;
   }
-  
+
   const path = ref.slice(2).split('/');
   let current: any = rootSchema;
-  
+
   for (const segment of path) {
     if (current === undefined || current === null) {
       return null;
     }
     current = current[segment];
   }
-  
+
   return typeof current === 'object' && current !== null ? current : null;
 }
 
@@ -856,7 +959,7 @@ function cleanSchemaForGemini(
   // Initialize root schema and visited set for cycle detection
   const root = rootSchema ?? schema;
   const seen = visited ?? new WeakSet<object>();
-  
+
   // Check for circular reference
   if (seen.has(schema)) {
     // Return a placeholder for circular references
@@ -865,14 +968,14 @@ function cleanSchemaForGemini(
       description: '(circular reference)',
     };
   }
-  
+
   // Mark as visited
   seen.add(schema);
 
   try {
     // Create a copy to avoid modifying the original
     let cleaned: Record<string, unknown> = {};
-    
+
     // Handle $ref - resolve and merge
     if (schema.$ref && typeof schema.$ref === 'string') {
       const resolved = resolveRef(schema.$ref, root);
@@ -884,7 +987,7 @@ function cleanSchemaForGemini(
             description: '(circular reference)',
           };
         }
-        
+
         // Merge resolved schema with current (excluding $ref)
         cleaned = { ...(resolved as Record<string, unknown>) };
         for (const [key, value] of Object.entries(schema)) {
@@ -969,7 +1072,7 @@ function cleanSchemaForGemini(
     // Process items
     if (cleaned.items) {
       if (Array.isArray(cleaned.items)) {
-        cleaned.items = cleaned.items.map(item => 
+        cleaned.items = cleaned.items.map(item =>
           cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
         );
       } else {
@@ -979,14 +1082,14 @@ function cleanSchemaForGemini(
 
     // Process anyOf
     if (cleaned.anyOf && Array.isArray(cleaned.anyOf)) {
-      cleaned.anyOf = cleaned.anyOf.map(item => 
+      cleaned.anyOf = cleaned.anyOf.map(item =>
         cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
       );
     }
 
     // Process oneOf
     if (cleaned.oneOf && Array.isArray(cleaned.oneOf)) {
-      cleaned.oneOf = cleaned.oneOf.map(item => 
+      cleaned.oneOf = cleaned.oneOf.map(item =>
         cleanSchemaForGemini(item as Record<string, unknown>, root, seen)
       );
     }
@@ -1069,7 +1172,7 @@ export function prepareImageGenerationRequest(
 ): Record<string, any> {
   const result = { ...requestBody };
   const modelLower = model.toLowerCase();
-  
+
   // Parse resolution
   let imageSize: string | undefined;
   if (modelLower.includes('-4k')) {
@@ -1077,7 +1180,7 @@ export function prepareImageGenerationRequest(
   } else if (modelLower.includes('-2k')) {
     imageSize = '2K';
   }
-  
+
   // Parse aspect ratio
   let aspectRatio: string | undefined;
   const ratioMap: Record<string, string> = {
@@ -1088,14 +1191,14 @@ export function prepareImageGenerationRequest(
     '-3x4': '3:4',
     '-1x1': '1:1',
   };
-  
+
   for (const [suffix, ratio] of Object.entries(ratioMap)) {
     if (modelLower.includes(suffix)) {
       aspectRatio = ratio;
       break;
     }
   }
-  
+
   // Build imageConfig
   const imageConfig: Record<string, string> = {};
   if (aspectRatio) {
@@ -1104,19 +1207,19 @@ export function prepareImageGenerationRequest(
   if (imageSize) {
     imageConfig.imageSize = imageSize;
   }
-  
+
   // Update model name to base image model
   result.model = 'gemini-3-pro-image';
   result.generationConfig = {
     candidateCount: 1,
     imageConfig,
   };
-  
+
   // Remove incompatible fields
   delete result.systemInstruction;
   delete result.tools;
   delete result.toolConfig;
-  
+
   return result;
 }
 
@@ -1135,13 +1238,13 @@ export function encodeToolCallIdsWithSignatures(message: any): any {
   if (!message || !message.tool_calls) {
     return message;
   }
-  
+
   const result = { ...message };
   result.tool_calls = message.tool_calls.map((tc: any) => ({
     ...tc,
     id: encodeToolIdWithSignature(tc.id, tc.thoughtSignature),
   }));
-  
+
   return result;
 }
 
@@ -1162,33 +1265,33 @@ export function fixToolCallArgsTypes(
   if (!args || !parametersSchema) {
     return args;
   }
-  
+
   const properties = parametersSchema.properties;
   if (!properties || typeof properties !== 'object') {
     return args;
   }
-  
+
   const fixedArgs: Record<string, unknown> = {};
-  
+
   for (const [key, value] of Object.entries(args)) {
     if (!(key in properties)) {
       // Parameter not in schema, keep as-is
       fixedArgs[key] = value;
       continue;
     }
-    
+
     const paramSchema = (properties as Record<string, unknown>)[key];
     if (!paramSchema || typeof paramSchema !== 'object') {
       fixedArgs[key] = value;
       continue;
     }
-    
+
     const paramType = (paramSchema as Record<string, unknown>).type;
     if (typeof paramType !== 'string') {
       fixedArgs[key] = value;
       continue;
     }
-    
+
     // Apply type conversion based on schema
     const converted = convertValueToSchemaType(value, paramType, key);
     if (debugLog && converted !== value) {
@@ -1196,7 +1299,7 @@ export function fixToolCallArgsTypes(
     }
     fixedArgs[key] = converted;
   }
-  
+
   return fixedArgs;
 }
 
@@ -1212,13 +1315,13 @@ function convertValueToSchemaType(
   if (value === null || value === undefined) {
     return value;
   }
-  
+
   switch (paramType) {
     case 'number':
     case 'integer':
       if (typeof value === 'string') {
-        const num = paramType === 'integer' 
-          ? parseInt(value, 10) 
+        const num = paramType === 'integer'
+          ? parseInt(value, 10)
           : parseFloat(value);
         if (!isNaN(num)) {
           return num;
@@ -1227,7 +1330,7 @@ function convertValueToSchemaType(
         return paramType === 'integer' ? Math.floor(value) : value;
       }
       return value;
-      
+
     case 'boolean':
       if (typeof value === 'string') {
         const lower = value.toLowerCase();
@@ -1239,13 +1342,13 @@ function convertValueToSchemaType(
         }
       }
       return value;
-      
+
     case 'string':
       if (typeof value !== 'string') {
         return String(value);
       }
       return value;
-      
+
     case 'array':
       if (typeof value === 'string') {
         try {
@@ -1261,7 +1364,7 @@ function convertValueToSchemaType(
         return reverseTransformArgs(value);
       }
       return value;
-      
+
     case 'object':
       if (typeof value === 'string') {
         try {
@@ -1277,7 +1380,7 @@ function convertValueToSchemaType(
         return reverseTransformArgs(value as Record<string, unknown>);
       }
       return value;
-      
+
     default:
       return value;
   }
@@ -1293,14 +1396,14 @@ export function reverseTransformValue(value: unknown): unknown {
   if (typeof value !== 'string') {
     return value;
   }
-  
+
   // Boolean conversion
   if (value === 'true') return true;
   if (value === 'false') return false;
-  
+
   // Null conversion
   if (value === 'null') return null;
-  
+
   // Number conversion (integers and floats)
   // Only convert if it looks like a pure number (no leading zeros except "0" or "-0")
   const trimmed = value.trim();
@@ -1320,7 +1423,7 @@ export function reverseTransformValue(value: unknown): unknown {
       }
     }
   }
-  
+
   // Keep as string
   return value;
 }
@@ -1333,12 +1436,12 @@ export function reverseTransformArgs(args: unknown): unknown {
   if (args === null || args === undefined) {
     return args;
   }
-  
+
   // Handle arrays
   if (Array.isArray(args)) {
     return args.map(item => reverseTransformArgs(item));
   }
-  
+
   // Handle objects
   if (typeof args === 'object') {
     const result: Record<string, unknown> = {};
@@ -1351,7 +1454,7 @@ export function reverseTransformArgs(args: unknown): unknown {
     }
     return result;
   }
-  
+
   // Handle primitive values
   return reverseTransformValue(args);
 }
@@ -1367,7 +1470,7 @@ const toolSchemaCache = new Map<string, Record<string, unknown>>();
  */
 export function registerToolSchemas(tools: any[] | undefined): void {
   if (!tools) return;
-  
+
   for (const tool of tools) {
     if (tool?.type === 'function' && tool.function?.name) {
       const normalizedName = normalizeFunctionName(tool.function.name);
@@ -1415,25 +1518,25 @@ export function hasValidThoughtSignature(block: Record<string, unknown>): boolea
   if (typeof block !== 'object' || block === null) {
     return true;
   }
-  
+
   const blockType = block.type as string;
   if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
     return true; // Non-thinking blocks are valid by default
   }
-  
+
   const thinking = block.thinking as string || '';
   const thoughtSignature = block.thoughtSignature as string | undefined;
-  
+
   // Empty thinking + any thoughtSignature = valid (trailing signature case)
   if (!thinking && thoughtSignature !== undefined) {
     return true;
   }
-  
+
   // Has content + sufficiently long thoughtSignature = valid
   if (thoughtSignature && typeof thoughtSignature === 'string' && thoughtSignature.length >= MIN_SIGNATURE_LENGTH) {
     return true;
   }
-  
+
   return false;
 }
 
@@ -1448,23 +1551,23 @@ export function sanitizeThinkingBlock(block: Record<string, unknown>): Record<st
   if (typeof block !== 'object' || block === null) {
     return block;
   }
-  
+
   const blockType = block.type as string;
   if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
     return block;
   }
-  
+
   // Rebuild block with only necessary fields
   const sanitized: Record<string, unknown> = {
     type: blockType,
     thinking: block.thinking || '',
   };
-  
+
   const thoughtSignature = block.thoughtSignature as string | undefined;
   if (thoughtSignature) {
     sanitized.thoughtSignature = thoughtSignature;
   }
-  
+
   return sanitized;
 }
 
@@ -1478,7 +1581,7 @@ export function removeTrailingUnsignedThinking(blocks: Record<string, unknown>[]
   if (!blocks || blocks.length === 0) {
     return;
   }
-  
+
   // Scan from end to beginning
   let endIndex = blocks.length;
   for (let i = blocks.length - 1; i >= 0; i--) {
@@ -1486,7 +1589,7 @@ export function removeTrailingUnsignedThinking(blocks: Record<string, unknown>[]
     if (typeof block !== 'object' || block === null) {
       break;
     }
-    
+
     const blockType = block.type as string;
     if (blockType === 'thinking' || blockType === 'redacted_thinking') {
       if (!hasValidThoughtSignature(block)) {
@@ -1498,7 +1601,7 @@ export function removeTrailingUnsignedThinking(blocks: Record<string, unknown>[]
       break; // Found non-thinking block, stop
     }
   }
-  
+
   if (endIndex < blocks.length) {
     blocks.splice(endIndex);
     // Log if needed: console.debug(`Removed trailing unsigned thinking block(s)`);
@@ -1517,36 +1620,36 @@ export function removeTrailingUnsignedThinking(blocks: Record<string, unknown>[]
  */
 export function filterInvalidThinkingBlocks(messages: OpenAIMessage[]): void {
   let totalFiltered = 0;
-  
+
   for (const msg of messages) {
     // Only process assistant/model messages
     if (msg.role !== 'assistant') {
       continue;
     }
-    
+
     const content = msg.content;
     if (typeof content !== 'object' || !Array.isArray(content)) {
       continue;
     }
-    
+
     // Process each content block
     const newBlocks: any[] = [];
-    
+
     for (const block of content) {
       if (typeof block !== 'object' || block === null) {
         newBlocks.push(block);
         continue;
       }
-      
+
       const blockRecord = block as unknown as Record<string, unknown>;
       const blockType = blockRecord.type as string;
-      
+
       // Skip non-thinking blocks
       if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
         newBlocks.push(block);
         continue;
       }
-      
+
       // All thinking blocks need sanitization (remove cache_control etc.)
       if (hasValidThoughtSignature(blockRecord)) {
         // Valid signature, sanitize and keep
@@ -1561,11 +1664,11 @@ export function filterInvalidThinkingBlocks(messages: OpenAIMessage[]): void {
         totalFiltered++;
       }
     }
-    
+
     // Update message content (ensure at least one block exists)
     (msg as any).content = newBlocks.length > 0 ? newBlocks : [{ type: 'text', text: '' }];
   }
-  
+
   if (totalFiltered > 0) {
     logWarn(`[ThinkingFilter] Filtered ${totalFiltered} invalid thinking block(s) from history`);
   }
@@ -1585,7 +1688,7 @@ export function processThinkingBlocks(messages: OpenAIMessage[]): OpenAIMessage[
   if (!messages || messages.length === 0) {
     return messages;
   }
-  
+
   // Deep clone to avoid modifying original
   const processed = messages.map(msg => ({
     ...msg,
@@ -1593,10 +1696,10 @@ export function processThinkingBlocks(messages: OpenAIMessage[]): OpenAIMessage[
       ? [...msg.content]
       : msg.content,
   }));
-  
+
   // Filter invalid thinking blocks
   filterInvalidThinkingBlocks(processed);
-  
+
   // Remove trailing unsigned thinking blocks from last assistant message
   for (let i = processed.length - 1; i >= 0; i--) {
     const msg = processed[i];
@@ -1608,6 +1711,6 @@ export function processThinkingBlocks(messages: OpenAIMessage[]): OpenAIMessage[
       break;
     }
   }
-  
+
   return processed;
 }
