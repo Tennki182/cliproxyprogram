@@ -18,6 +18,7 @@ import { getConfig } from '../config.js';
 
 export interface ConvertOptions {
   includeThoughtSignature?: boolean;
+  tools?: any[];
 }
 
 // Separator for encoding thoughtSignature in tool_call_id
@@ -69,6 +70,22 @@ function buildToolCallIdToNameMap(messages: OpenAIMessage[]): Map<string, string
     }
   }
   return map;
+}
+
+function buildToolSchemaMap(tools: any[] | undefined): Map<string, Record<string, unknown>> {
+  const schemaMap = new Map<string, Record<string, unknown>>();
+
+  if (!tools) {
+    return schemaMap;
+  }
+
+  for (const tool of tools) {
+    if (tool?.type === 'function' && tool.function?.name && tool.function.parameters) {
+      schemaMap.set(normalizeFunctionName(tool.function.name), tool.function.parameters);
+    }
+  }
+
+  return schemaMap;
 }
 
 /**
@@ -134,6 +151,7 @@ export function convertMessagesToContents(
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
   const includeThought = options?.includeThoughtSignature ?? true;
+  const toolSchemas = buildToolSchemaMap(options?.tools);
 
   // Process thinking blocks: filter invalid ones and sanitize
   const processedMessages = processThinkingBlocks(messages);
@@ -196,7 +214,7 @@ export function convertMessagesToContents(
           const normalizedName = normalizeFunctionName(toolCall.function.name);
 
           // Fix argument types based on cached tool schema
-          const toolSchema = getToolSchema(normalizedName);
+          const toolSchema = toolSchemas.get(normalizedName);
           if (toolSchema) {
             args = fixToolCallArgsTypes(args, toolSchema);
           }
@@ -1457,44 +1475,6 @@ export function reverseTransformArgs(args: unknown): unknown {
 
   // Handle primitive values
   return reverseTransformValue(args);
-}
-
-// ==================== Tool Schema Cache ====================
-
-// Cache for tool parameter schemas (function name -> schema)
-const toolSchemaCache = new Map<string, Record<string, unknown>>();
-
-/**
- * Register tool schemas for later type fixing.
- * Call this when processing tools in a request.
- */
-export function registerToolSchemas(tools: any[] | undefined): void {
-  if (!tools) return;
-
-  for (const tool of tools) {
-    if (tool?.type === 'function' && tool.function?.name) {
-      const normalizedName = normalizeFunctionName(tool.function.name);
-      if (tool.function.parameters) {
-        toolSchemaCache.set(normalizedName, tool.function.parameters);
-      }
-    }
-  }
-}
-
-/**
- * Get cached tool schema by function name.
- */
-export function getToolSchema(functionName: string): Record<string, unknown> | undefined {
-  const normalizedName = normalizeFunctionName(functionName);
-  return toolSchemaCache.get(normalizedName);
-}
-
-/**
- * Clear tool schema cache.
- * Call this at the end of a request to free memory.
- */
-export function clearToolSchemaCache(): void {
-  toolSchemaCache.clear();
 }
 
 // ==================== Thinking Block Validation and Sanitization ====================

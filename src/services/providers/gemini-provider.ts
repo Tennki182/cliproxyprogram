@@ -9,10 +9,12 @@ import {
   extractSystemInstruction,
   encodeToolIdWithSignature,
   isImageGenerationModel,
+  isSearchModel,
   prepareImageGenerationRequest,
   getBaseModelName,
 } from '../converter.js';
 import { resolveModelAlias } from '../models.js';
+import { applyPayloadConfig } from '../payload.js';
 
 function generateId(): string {
   return 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
@@ -44,13 +46,29 @@ export class GeminiProvider implements Provider {
       actualModel = 'gemini-3-pro-image';
     }
 
-    const contents = convertMessagesToContents(request.messages, {
+    // Apply payload configuration (default/override/filter rules)
+    const processedRequest = applyPayloadConfig(model, 'openai', request);
+
+    const contents = convertMessagesToContents(processedRequest.messages, {
       includeThoughtSignature: backend.needsThoughtSignature,
+      tools: processedRequest.tools,
     });
-    const systemInstruction = extractSystemInstruction(request.messages);
-    let generationConfig = convertToGeminiConfig(request);
-    const tools = convertToolsToGemini(request.tools);
-    const toolConfig = convertToolChoice(request.tool_choice);
+    const systemInstruction = extractSystemInstruction(processedRequest.messages);
+    let generationConfig = convertToGeminiConfig(processedRequest);
+    let tools = convertToolsToGemini(processedRequest.tools);
+    const toolConfig = convertToolChoice(processedRequest.tool_choice);
+
+    // Auto-add googleSearch tool for -search models (reference: gcli2api)
+    if (isSearchModel(model)) {
+      if (!tools) {
+        tools = [];
+      }
+      // Check if googleSearch is already added
+      const hasGoogleSearch = tools.some((t: any) => t.googleSearch);
+      if (!hasGoogleSearch) {
+        tools.push({ googleSearch: {} });
+      }
+    }
 
     // Handle image generation request transformation
     if (isImageGenerationModel(model)) {
@@ -90,13 +108,29 @@ export class GeminiProvider implements Provider {
       actualModel = 'gemini-3-pro-image';
     }
 
-    const contents = convertMessagesToContents(request.messages, {
+    // Apply payload configuration (default/override/filter rules)
+    const processedRequest = applyPayloadConfig(model, 'openai', request);
+
+    const contents = convertMessagesToContents(processedRequest.messages, {
       includeThoughtSignature: backend.needsThoughtSignature,
+      tools: processedRequest.tools,
     });
-    const systemInstruction = extractSystemInstruction(request.messages);
-    const generationConfig = convertToGeminiConfig(request);
-    const tools = convertToolsToGemini(request.tools);
-    const toolConfig = convertToolChoice(request.tool_choice);
+    const systemInstruction = extractSystemInstruction(processedRequest.messages);
+    const generationConfig = convertToGeminiConfig(processedRequest);
+    let tools = convertToolsToGemini(processedRequest.tools);
+    const toolConfig = convertToolChoice(processedRequest.tool_choice);
+
+    // Auto-add googleSearch tool for -search models (reference: gcli2api)
+    if (isSearchModel(model)) {
+      if (!tools) {
+        tools = [];
+      }
+      // Check if googleSearch is already added
+      const hasGoogleSearch = tools.some((t: any) => t.googleSearch);
+      if (!hasGoogleSearch) {
+        tools.push({ googleSearch: {} });
+      }
+    }
 
     const stream = await backend.generateContentStream(
       actualModel, contents, systemInstruction, generationConfig, tools, toolConfig
@@ -165,8 +199,9 @@ export class GeminiProvider implements Provider {
           }
         } else if (part.functionCall) {
           // Encode thoughtSignature into tool_call_id if present
+          const rawToolId = part.functionCall.id || `call_${Date.now()}_${toolCalls.length}`;
           const toolId = encodeToolIdWithSignature(
-            `call_${Date.now()}_${toolCalls.length}`,
+            rawToolId,
             part.thoughtSignature
           );
           
@@ -269,8 +304,9 @@ export class GeminiProvider implements Provider {
           }
         } else if (part.functionCall) {
           // Encode thoughtSignature into tool_call_id if present
+          const rawToolId = part.functionCall.id || `call_${index}_${toolCalls.length}`;
           const toolId = encodeToolIdWithSignature(
-            `call_${index}_${toolCalls.length}`,
+            rawToolId,
             part.thoughtSignature
           );
           

@@ -16,6 +16,11 @@ const PUBLIC_SAFETY_SETTINGS = [
   { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
   { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
   { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_IMAGE_HATE', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_IMAGE_HARASSMENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_JAILBREAK', threshold: 'BLOCK_NONE' },
 ];
 
 /**
@@ -62,14 +67,16 @@ function buildPublicBody(
   };
 
   if (generationConfig) {
-    // Normalize generation config: force optimal defaults
+    // Set reasonable defaults only if not already specified
     const normalizedConfig = { ...generationConfig };
-    // Force maxOutputTokens to 64000 only if not set or too small
-    if (!normalizedConfig.maxOutputTokens || normalizedConfig.maxOutputTokens < 1000) {
+    // Set default maxOutputTokens only if not already specified by user
+    if (normalizedConfig.maxOutputTokens === undefined) {
       normalizedConfig.maxOutputTokens = 64000;
     }
-    // Force topK to 64 for better diversity
-    normalizedConfig.topK = 64;
+    // Set default topK only if not already specified by user
+    if (normalizedConfig.topK === undefined) {
+      normalizedConfig.topK = 64;
+    }
     body.generationConfig = normalizedConfig;
   } else {
     // Add default generation config with optimal settings

@@ -4,7 +4,7 @@ import { enqueue } from '../services/queue.js';
 import { recordRequest } from './management.js';
 import { logReq, logError } from '../services/log-stream.js';
 import { createSSEKeepAlive } from '../services/sse-utils.js';
-import { decodeToolIdAndSignature, reverseTransformArgs, registerToolSchemas, clearToolSchemaCache } from '../services/converter.js';
+import { decodeToolIdAndSignature, reverseTransformArgs } from '../services/converter.js';
 
 /**
  * Gemini-native API endpoints.
@@ -50,9 +50,7 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
   const { provider, resolvedModel } = providerResult;
   logReq(`Gemini req → ${provider.name}/${resolvedModel}`, { format: 'gemini', model: resolvedModel, stream: false });
 
-  // Register tool schemas for type fixing
-  registerToolSchemas(body.tools);
-
+  // Convert Gemini-native request into the shared OpenAI-style provider payload.
   const messages = geminiContentsToMessages(body.contents, body.systemInstruction);
   const openaiRequest: any = {
     model: resolvedModel,
@@ -86,8 +84,6 @@ async function handleGenerateContent(model: string, body: any, reply: FastifyRep
     logError(`Gemini req 失败: ${error.message}`, { model: resolvedModel });
     recordRequest(false);
     return reply.status(500).send({ error: { message: error.message } });
-  } finally {
-    clearToolSchemaCache();
   }
 }
 
@@ -102,9 +98,7 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
   const { provider, resolvedModel } = providerResult;
   logReq(`Gemini stream → ${provider.name}/${resolvedModel}`, { format: 'gemini', model: resolvedModel, stream: true });
 
-  // Register tool schemas for type fixing
-  registerToolSchemas(body.tools);
-
+  // Convert Gemini-native request into the shared OpenAI-style provider payload.
   const messages = geminiContentsToMessages(body.contents, body.systemInstruction);
   const openaiRequest: any = {
     model: resolvedModel,
@@ -164,8 +158,6 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
       return reply;
     }
     return reply.status(500).send({ error: { message: error.message } });
-  } finally {
-    clearToolSchemaCache();
   }
 }
 
@@ -173,19 +165,17 @@ async function handleStreamGenerateContent(model: string, body: any, reply: Fast
  * Build a tool call tracking map from messages
  * Maps normalized function names to tool call IDs
  */
-function buildToolCallTrackingMap(messages: any[]): Map<string, string> {
-  const map = new Map<string, string>();
+function buildToolCallTrackingMap(messages: any[]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
   
   for (const msg of messages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         if (tc.function?.name && tc.id) {
-          // Store mapping from normalized name to tool ID
           const normalizedName = tc.function.name.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-          // If same function called multiple times, keep the first (oldest) mapping
-          if (!map.has(normalizedName)) {
-            map.set(normalizedName, tc.id);
-          }
+          const ids = map.get(normalizedName) || [];
+          ids.push(tc.id);
+          map.set(normalizedName, ids);
         }
       }
     }
@@ -226,7 +216,7 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
           // Apply reverse transform to convert string values back to native types
           const args = reverseTransformArgs(p.functionCall.args);
           return {
-            id: `call_${messages.length}_${i}`,
+            id: p.functionCall.id || `call_${messages.length}_${i}`,
             type: 'function',
             function: {
               name: p.functionCall.name,
@@ -244,6 +234,7 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
       messages.push({
         role: 'tool',
         _functionName: p.functionResponse.name,
+        _toolCallId: p.functionResponse.id,
         content: JSON.stringify(p.functionResponse.response),
       });
     }
@@ -254,9 +245,17 @@ function geminiContentsToMessages(contents: any[], systemInstruction?: any): any
   
   for (const msg of messages) {
     if (msg.role === 'tool' && msg._functionName) {
+      if (msg._toolCallId) {
+        msg.tool_call_id = msg._toolCallId;
+        delete msg._toolCallId;
+        delete msg._functionName;
+        continue;
+      }
+
       // Try to find matching tool call by normalized function name
       const normalizedName = msg._functionName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-      const matchedId = toolCallMap.get(normalizedName);
+      const matchedIds = toolCallMap.get(normalizedName);
+      const matchedId = matchedIds?.shift();
       
       if (matchedId) {
         msg.tool_call_id = matchedId;
@@ -300,6 +299,7 @@ function openaiResponseToGemini(openai: any): any {
       
       const part: any = {
         functionCall: {
+          id: tc.id,
           name: tc.function.name,
           args,
         },
@@ -356,6 +356,7 @@ function openaiChunkToGemini(chunk: any): any {
       
       const part: any = {
         functionCall: {
+          id: tc.id,
           name: tc.function.name,
           args,
         },
