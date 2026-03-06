@@ -1,5 +1,6 @@
 import { Provider } from '../provider.js';
 import { pfetch } from '../http.js';
+import { countRequestInputTokens } from '../token-counter.js';
 import {
   OpenAICompatProvider as ProviderConfig,
   getEnabledProviders,
@@ -178,6 +179,15 @@ export class OpenAICompatProvider implements Provider {
     }
 
     return parseStream();
+  }
+
+  async countTokens(_model: string, request: any): Promise<{ input_tokens: number; total_tokens: number; estimated: boolean }> {
+    const total = countRequestInputTokens(request);
+    return {
+      input_tokens: total,
+      total_tokens: total,
+      estimated: true,
+    };
   }
 
   isModelSupported(model: string): boolean {

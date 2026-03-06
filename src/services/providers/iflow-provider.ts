@@ -5,8 +5,9 @@ import { pfetch } from '../http.js';
 import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getIFlowOAuthConfig, getConfig } from '../../config.js';
 import { getCredential as getStoredCredential, saveCredential, listCredentials } from '../../storage/credentials.js';
-import { logWarn, logInfo } from '../log-stream.js';
-import { calculateRequestTokens, countMessagesTokens } from '../token-counter.js';
+import { formatErrorMessage, logWarn, logInfo } from '../log-stream.js';
+import { calculateRequestTokens, countRequestInputTokens } from '../token-counter.js';
+import { getBaseModelName, getThinkingSettingsFromModel } from '../converter.js';
 
 interface IFlowTokenData {
   access_token: string;
@@ -153,6 +154,92 @@ function ensureToolsArray(body: any): any {
   return body;
 }
 
+function isGLMModel(model: string): boolean {
+  return getBaseModelName(model).toLowerCase().startsWith('glm');
+}
+
+function isMiniMaxModel(model: string): boolean {
+  return getBaseModelName(model).toLowerCase().startsWith('minimax');
+}
+
+function usesEnableThinkingModel(model: string): boolean {
+  const baseModel = getBaseModelName(model).toLowerCase();
+  if (baseModel.startsWith('glm')) {
+    return true;
+  }
+
+  return baseModel === 'qwen3-max-preview'
+    || baseModel === 'deepseek-v3.1'
+    || baseModel === 'deepseek-v3.2';
+}
+
+function resolveIFlowThinkingEnabled(model: string, request: any): boolean | undefined {
+  if (request.reasoning_effort !== undefined) {
+    return request.reasoning_effort !== 'none';
+  }
+
+  if (request.thinking_budget !== undefined) {
+    return request.thinking_budget !== 0;
+  }
+
+  const thinkingSettings = getThinkingSettingsFromModel(model);
+  if (!thinkingSettings) {
+    return undefined;
+  }
+
+  if (thinkingSettings.thinkingBudget !== undefined) {
+    return thinkingSettings.thinkingBudget !== 0;
+  }
+
+  if (thinkingSettings.thinkingLevel !== undefined) {
+    return thinkingSettings.thinkingLevel !== 'none';
+  }
+
+  return undefined;
+}
+
+function applyIFlowThinkingConfig(body: any, model: string, request: any): any {
+  const thinkingEnabled = resolveIFlowThinkingEnabled(model, request);
+  if (thinkingEnabled === undefined) {
+    return body;
+  }
+
+  if (isMiniMaxModel(model)) {
+    const nextBody = { ...body, reasoning_split: thinkingEnabled };
+    if (nextBody.chat_template_kwargs) {
+      const nextChatTemplateKwargs = { ...nextBody.chat_template_kwargs };
+      delete nextChatTemplateKwargs.enable_thinking;
+      delete nextChatTemplateKwargs.clear_thinking;
+      if (Object.keys(nextChatTemplateKwargs).length > 0) {
+        nextBody.chat_template_kwargs = nextChatTemplateKwargs;
+      } else {
+        delete nextBody.chat_template_kwargs;
+      }
+    }
+    return nextBody;
+  }
+
+  if (!usesEnableThinkingModel(model)) {
+    return body;
+  }
+
+  const nextChatTemplateKwargs = {
+    ...(body.chat_template_kwargs || {}),
+    enable_thinking: thinkingEnabled,
+  };
+
+  if (thinkingEnabled && isGLMModel(model)) {
+    nextChatTemplateKwargs.clear_thinking = false;
+  } else {
+    delete nextChatTemplateKwargs.clear_thinking;
+  }
+
+  return {
+    ...body,
+    chat_template_kwargs: nextChatTemplateKwargs,
+  };
+}
+
 export class IFlowProvider implements Provider {
   readonly name = 'iflow';
 
@@ -216,6 +303,7 @@ export class IFlowProvider implements Provider {
   }
 
   async chatCompletion(model: string, request: any): Promise<any> {
+    const actualModel = getBaseModelName(model);
     const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
     const triedCredentials = new Set<string>();
     let attemptCount = 0;
@@ -274,7 +362,7 @@ export class IFlowProvider implements Provider {
       const messages = preserveReasoningContent(request.messages);
       
       let body: any = {
-        model,
+        model: actualModel,
         messages,
         stream: false,
       };
@@ -286,6 +374,7 @@ export class IFlowProvider implements Provider {
       
       // Ensure tools array is not empty
       body = ensureToolsArray(body);
+      body = applyIFlowThinkingConfig(body, model, request);
       
       try {
         const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
@@ -305,7 +394,7 @@ export class IFlowProvider implements Provider {
         if (!response.ok) {
           const errorText = await response.text();
           const statusCode = response.status;
-          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          errors.push({ accountId, statusCode, message: errorText });
           
           // Handle 429 - wait 1s then try next credential
           if (statusCode === 429) {
@@ -350,8 +439,9 @@ export class IFlowProvider implements Provider {
         
         return result;
       } catch (error: any) {
-        errors.push({ accountId, statusCode: 0, message: error.message });
-        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        const errorMessage = formatErrorMessage(error);
+        errors.push({ accountId, statusCode: 0, message: errorMessage });
+        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${errorMessage}，切换下一个凭证...`);
         
         const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
         if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
@@ -363,11 +453,12 @@ export class IFlowProvider implements Provider {
     }
     
     // All credentials exhausted
-    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message}`).join('\n');
     throw new Error(`[iFlow] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
+    const actualModel = getBaseModelName(model);
     const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
     const triedCredentials = new Set<string>();
     let attemptCount = 0;
@@ -426,10 +517,13 @@ export class IFlowProvider implements Provider {
       const messages = preserveReasoningContent(request.messages);
       
       // Calculate estimated tokens for usage tracking
-      const estimatedTokens = countMessagesTokens(messages);
+      const estimatedTokens = countRequestInputTokens({
+        messages,
+        tools: request.tools,
+      });
       
       let body: any = {
-        model,
+        model: actualModel,
         messages,
         stream: true,
       };
@@ -441,6 +535,7 @@ export class IFlowProvider implements Provider {
       
       // Ensure tools array is not empty
       body = ensureToolsArray(body);
+      body = applyIFlowThinkingConfig(body, model, request);
       
       try {
         const response = await pfetch(`${iflowConfig.apiBase}/chat/completions`, {
@@ -460,7 +555,7 @@ export class IFlowProvider implements Provider {
         if (!response.ok) {
           const errorText = await response.text();
           const statusCode = response.status;
-          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          errors.push({ accountId, statusCode, message: errorText });
           
           // Handle 429 - wait 1s then try next credential
           if (statusCode === 429) {
@@ -559,8 +654,9 @@ export class IFlowProvider implements Provider {
         
         return parseStream();
       } catch (error: any) {
-        errors.push({ accountId, statusCode: 0, message: error.message });
-        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        const errorMessage = formatErrorMessage(error);
+        errors.push({ accountId, statusCode: 0, message: errorMessage });
+        logWarn(`[iFlow] 凭证 [${accountId}] 请求错误: ${errorMessage}，切换下一个凭证...`);
         
         const nextCred = await acquireCredential({ requireProject: false, provider: 'iflow' });
         if (nextCred && `${nextCred.account_id}:iflow` !== credKey) {
@@ -572,12 +668,22 @@ export class IFlowProvider implements Provider {
     }
     
     // All credentials exhausted
-    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message}`).join('\n');
     throw new Error(`[iFlow] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
+  }
+
+  async countTokens(_model: string, request: any): Promise<{ input_tokens: number; total_tokens: number; estimated: boolean }> {
+    const total = countRequestInputTokens(request);
+    return {
+      input_tokens: total,
+      total_tokens: total,
+      estimated: true,
+    };
   }
 
   isModelSupported(model: string): boolean {
     const config = getConfig();
-    return config.iflow.supportedModels.some((m: string) => model.includes(m));
+    const baseModel = getBaseModelName(model);
+    return config.iflow.supportedModels.some((m: string) => baseModel.includes(m));
   }
 }

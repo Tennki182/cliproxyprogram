@@ -1,5 +1,5 @@
 import { getConfig } from '../config.js';
-import { logWarn } from './log-stream.js';
+import { formatErrorMessage, logWarn } from './log-stream.js';
 
 const MAX_QUEUE_SIZE = 100;
 const MAX_RETRIES = 10; // 增加最大重试次数
@@ -52,8 +52,8 @@ async function processQueue(): Promise<void> {
           baseDelay * Math.pow(1.5, item.retries - 1),
           maxDelay
         );
-        const errorMsg = error?.message || '未知错误';
-        logWarn(`请求失败，第 ${item.retries} 次重试，${Math.round(delay)}ms 后重试，错误: ${errorMsg.substring(0, 100)}`);
+        const errorMsg = formatErrorMessage(error) || '未知错误';
+        logWarn(`请求失败，第 ${item.retries} 次重试，${Math.round(delay)}ms 后重试，错误: ${errorMsg}`);
         // Schedule re-queue after delay
         setTimeout(() => {
           if (queue.length >= MAX_QUEUE_SIZE) {

@@ -4,8 +4,9 @@ import { acquireCredential, reportRateLimit } from '../rotation.js';
 import { getCodexOAuthConfig, getConfig } from '../../config.js';
 import { listCredentials } from '../../storage/credentials.js';
 import { randomUUID } from 'crypto';
-import { countMessagesTokens, estimateTokens } from '../token-counter.js';
-import { logWarn } from '../log-stream.js';
+import { countMessagesTokens, countRequestInputTokens, estimateTokens } from '../token-counter.js';
+import { getBaseModelName, getThinkingSettingsFromModel } from '../converter.js';
+import { formatErrorMessage, logWarn } from '../log-stream.js';
 
 // Codex cache for prompt_cache_key
 interface CodexCache {
@@ -174,6 +175,81 @@ function processToolChoice(toolChoice: any, shortNameMap: Map<string, string>): 
   return toolChoice;
 }
 
+function buildCodexTools(tools: any[] | undefined, shortNameMap: Map<string, string>): any[] {
+  if (!tools || tools.length === 0) {
+    return [];
+  }
+
+  return tools.flatMap((tool: any) => {
+    if (tool.type === 'function' && tool.function?.name) {
+      const shortName = shortNameMap.get(tool.function.name) || tool.function.name;
+      return [{
+        type: 'function',
+        name: shortName,
+        description: tool.function.description || '',
+        parameters: tool.function.parameters || { type: 'object', properties: {} },
+        strict: false,
+      }];
+    }
+
+    if (typeof tool?.type === 'string') {
+      return [{ ...tool }];
+    }
+
+    return [];
+  });
+}
+
+function mapThinkingSettingsToCodexEffort(model: string): 'low' | 'medium' | 'high' | 'auto' | 'none' | undefined {
+  const thinkingSettings = getThinkingSettingsFromModel(model);
+  if (!thinkingSettings) {
+    return undefined;
+  }
+
+  if (thinkingSettings.thinkingLevel) {
+    switch (thinkingSettings.thinkingLevel) {
+      case 'none':
+        return 'none';
+      case 'minimal':
+      case 'low':
+        return 'low';
+      case 'medium':
+        return 'medium';
+      case 'high':
+      case 'xhigh':
+        return 'high';
+      default:
+        return undefined;
+    }
+  }
+
+  if (thinkingSettings.thinkingBudget !== undefined) {
+    if (thinkingSettings.thinkingBudget === 0) {
+      return 'none';
+    }
+    if (thinkingSettings.thinkingBudget < 0) {
+      return 'auto';
+    }
+    if (thinkingSettings.thinkingBudget <= 1024) {
+      return 'low';
+    }
+    if (thinkingSettings.thinkingBudget <= 8192) {
+      return 'medium';
+    }
+    return 'high';
+  }
+
+  return undefined;
+}
+
+function getCodexReasoningEffort(model: string, request: any): 'low' | 'medium' | 'high' | 'auto' | 'none' {
+  if (request.reasoning_effort) {
+    return request.reasoning_effort;
+  }
+
+  return mapThinkingSettingsToCodexEffort(model) || 'medium';
+}
+
 export class CodexProvider implements Provider {
   readonly name = 'codex';
 
@@ -215,6 +291,7 @@ export class CodexProvider implements Provider {
   }
 
   async chatCompletion(model: string, request: any): Promise<any> {
+    const actualModel = getBaseModelName(model);
     // Check for /responses/compact endpoint
     if (request.compact === true || request.stream === false) {
       return this.executeCompact(model, request);
@@ -283,14 +360,14 @@ export class CodexProvider implements Provider {
 
       // Codex API 强制要求 stream: true
       let body: any = {
-        model,
+        model: actualModel,
         stream: true,
         input,
         instructions: systemMsg?.content ?? '',
         store: false,
         parallel_tool_calls: true,
         reasoning: {
-          effort: request.reasoning_effort || 'medium',
+          effort: getCodexReasoningEffort(model, request),
           summary: 'auto',
         },
         include: ['reasoning.encrypted_content'],
@@ -298,18 +375,7 @@ export class CodexProvider implements Provider {
       
       // Add tools if provided (with shortened names)
       if (request.tools && request.tools.length > 0) {
-        body.tools = request.tools
-          .filter((t: any) => t.type === 'function')
-          .map((t: any) => {
-            const shortName = shortNameMap.get(t.function.name) || t.function.name;
-            return {
-              type: 'function',
-              name: shortName,
-              description: t.function.description || '',
-              parameters: t.function.parameters || { type: 'object', properties: {} },
-              strict: false,
-            };
-          });
+        body.tools = buildCodexTools(request.tools, shortNameMap);
         
         body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
         
@@ -320,7 +386,7 @@ export class CodexProvider implements Provider {
       }
 
       // Apply cache
-      const cacheKey = this.getCacheKey(request, model);
+      const cacheKey = this.getCacheKey(request, actualModel);
       const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
       body = finalBody;
 
@@ -346,7 +412,7 @@ export class CodexProvider implements Provider {
         if (!response.ok) {
           const errorText = await response.text();
           const statusCode = response.status;
-          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          errors.push({ accountId, statusCode, message: errorText });
           
           // Handle 429 - wait 1s then try next credential
           if (statusCode === 429) {
@@ -432,8 +498,9 @@ export class CodexProvider implements Provider {
           throw error;
         }
         
-        errors.push({ accountId, statusCode: 0, message: error.message });
-        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        const errorMessage = formatErrorMessage(error);
+        errors.push({ accountId, statusCode: 0, message: errorMessage });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${errorMessage}，切换下一个凭证...`);
         
         const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
         if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
@@ -445,11 +512,12 @@ export class CodexProvider implements Provider {
     }
     
     // All credentials exhausted
-    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message}`).join('\n');
     throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
   async chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>> {
+    const actualModel = getBaseModelName(model);
     const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
     const triedCredentials = new Set<string>();
     let attemptCount = 0;
@@ -512,14 +580,14 @@ export class CodexProvider implements Provider {
       const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
       let body: any = {
-        model,
+        model: actualModel,
         stream: true,
         input,
         instructions: systemMsg?.content ?? '',
         store: false,
         parallel_tool_calls: true,
         reasoning: {
-          effort: request.reasoning_effort || 'medium',
+          effort: getCodexReasoningEffort(model, request),
           summary: 'auto',
         },
         include: ['reasoning.encrypted_content'],
@@ -527,18 +595,7 @@ export class CodexProvider implements Provider {
       
       // Add tools if provided (with shortened names)
       if (request.tools && request.tools.length > 0) {
-        body.tools = request.tools
-          .filter((t: any) => t.type === 'function')
-          .map((t: any) => {
-            const shortName = shortNameMap.get(t.function.name) || t.function.name;
-            return {
-              type: 'function',
-              name: shortName,
-              description: t.function.description || '',
-              parameters: t.function.parameters || { type: 'object', properties: {} },
-              strict: false,
-            };
-          });
+        body.tools = buildCodexTools(request.tools, shortNameMap);
         
         body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
         
@@ -549,7 +606,7 @@ export class CodexProvider implements Provider {
       }
 
       // Apply cache
-      const cacheKey = this.getCacheKey(request, model);
+      const cacheKey = this.getCacheKey(request, actualModel);
       const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
       body = finalBody;
 
@@ -575,7 +632,7 @@ export class CodexProvider implements Provider {
         if (!response.ok) {
           const errorText = await response.text();
           const statusCode = response.status;
-          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          errors.push({ accountId, statusCode, message: errorText });
           
           // Handle 429 - wait 1s then try next credential
           if (statusCode === 429) {
@@ -771,8 +828,9 @@ export class CodexProvider implements Provider {
           throw error;
         }
         
-        errors.push({ accountId, statusCode: 0, message: error.message });
-        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        const errorMessage = formatErrorMessage(error);
+        errors.push({ accountId, statusCode: 0, message: errorMessage });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${errorMessage}，切换下一个凭证...`);
         
         const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
         if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
@@ -784,7 +842,7 @@ export class CodexProvider implements Provider {
     }
     
     // All credentials exhausted
-    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message}`).join('\n');
     throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
   }
 
@@ -792,6 +850,7 @@ export class CodexProvider implements Provider {
    * Execute compact request (non-streaming, for /responses/compact)
    */
   private async executeCompact(model: string, request: any): Promise<any> {
+    const actualModel = getBaseModelName(model);
     const errors: Array<{ accountId: string; statusCode: number; message: string }> = [];
     const triedCredentials = new Set<string>();
     let attemptCount = 0;
@@ -853,31 +912,20 @@ export class CodexProvider implements Provider {
       const input = convertToResponsesInput(request.messages || [], shortNameMap);
 
       let body: any = {
-        model,
+        model: actualModel,
         input,
         instructions: request.messages?.find((m: any) => m.role === 'system')?.content ?? '',
         store: false,
         parallel_tool_calls: true,
         reasoning: {
-          effort: request.reasoning_effort || 'medium',
+          effort: getCodexReasoningEffort(model, request),
           summary: 'auto',
         },
       };
       
       // Add tools if provided
       if (request.tools && request.tools.length > 0) {
-        body.tools = request.tools
-          .filter((t: any) => t.type === 'function')
-          .map((t: any) => {
-            const shortName = shortNameMap.get(t.function.name) || t.function.name;
-            return {
-              type: 'function',
-              name: shortName,
-              description: t.function.description || '',
-              parameters: t.function.parameters || { type: 'object', properties: {} },
-              strict: false,
-            };
-          });
+        body.tools = buildCodexTools(request.tools, shortNameMap);
         
         body.tool_choice = processToolChoice(request.tool_choice, shortNameMap);
         
@@ -888,7 +936,7 @@ export class CodexProvider implements Provider {
       }
 
       // Apply cache
-      const cacheKey = this.getCacheKey(request, model);
+      const cacheKey = this.getCacheKey(request, actualModel);
       const { body: finalBody, cacheId } = this.applyCache(body, cacheKey, request);
       body = finalBody;
 
@@ -914,7 +962,7 @@ export class CodexProvider implements Provider {
         if (!response.ok) {
           const errorText = await response.text();
           const statusCode = response.status;
-          errors.push({ accountId, statusCode, message: errorText.substring(0, 200) });
+          errors.push({ accountId, statusCode, message: errorText });
           
           // Handle 429 - wait 1s then try next credential
           if (statusCode === 429) {
@@ -946,8 +994,9 @@ export class CodexProvider implements Provider {
         const data = await response.json();
         return this.responsesApiToOpenAI(model, data, reverseMap, undefined, request);
       } catch (error: any) {
-        errors.push({ accountId, statusCode: 0, message: error.message });
-        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${error.message?.substring(0, 100)}，切换下一个凭证...`);
+        const errorMessage = formatErrorMessage(error);
+        errors.push({ accountId, statusCode: 0, message: errorMessage });
+        logWarn(`[Codex] 凭证 [${accountId}] 请求错误: ${errorMessage}，切换下一个凭证...`);
         
         const nextCred = await acquireCredential({ requireProject: false, provider: 'codex' });
         if (nextCred && `${nextCred.account_id}:codex` !== credKey) {
@@ -959,13 +1008,23 @@ export class CodexProvider implements Provider {
     }
     
     // All credentials exhausted
-    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message.substring(0, 50)}`).join('; ');
+    const errorSummary = errors.map(e => `[${e.accountId}] ${e.statusCode}: ${e.message}`).join('\n');
     throw new Error(`[Codex] 所有 ${totalCredentials} 个凭证均请求失败。错误汇总: ${errorSummary || '未知错误'}`);
+  }
+
+  async countTokens(_model: string, request: any): Promise<{ input_tokens: number; total_tokens: number; estimated: boolean }> {
+    const total = countRequestInputTokens(request);
+    return {
+      input_tokens: total,
+      total_tokens: total,
+      estimated: true,
+    };
   }
 
   isModelSupported(model: string): boolean {
     const config = getConfig();
-    return config.codex.supportedModels.some((m: string) => model.includes(m));
+    const baseModel = getBaseModelName(model);
+    return config.codex.supportedModels.some((m: string) => baseModel.includes(m));
   }
 
   /**

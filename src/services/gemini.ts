@@ -14,7 +14,7 @@ import {
   markCredentialRateLimited,
   listCredentials,
 } from '../storage/credentials.js';
-import { logWarn } from './log-stream.js';
+import { formatErrorMessage, logWarn } from './log-stream.js';
 
 const SAFETY_SETTINGS = [
   { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
@@ -401,7 +401,7 @@ async function requestWithRetry(
         } catch { /* use raw text */ }
         
         // Record this error
-        errors.push({ accountId, statusCode, message: errorMessage.substring(0, 200) });
+        errors.push({ accountId, statusCode, message: errorMessage });
         
         // Handle 403 account validation error - mark and try next credential
         if (statusCode === 403) {
@@ -501,8 +501,8 @@ async function requestWithRetry(
       
     } catch (error: any) {
       // Record error
-      const errorMsg = error.message || '未知错误';
-      errors.push({ accountId, statusCode: 0, message: errorMsg.substring(0, 200) });
+      const errorMsg = formatErrorMessage(error) || '未知错误';
+      errors.push({ accountId, statusCode: 0, message: errorMsg });
       
       // If it's a thrown error from above (non-retryable), re-throw
       if (error.message?.includes('Gemini API 错误') && isFatalError(parseInt(error.message.match(/\((\d+)\)/)?.[1] || '0'))) {
@@ -510,7 +510,7 @@ async function requestWithRetry(
       }
       
       // Network or other errors - try next credential
-      logWarn(`凭证 [${accountId}] 请求错误: ${errorMsg.substring(0, 100)}，切换下一个凭证...`);
+      logWarn(`凭证 [${accountId}] 请求错误: ${errorMsg}，切换下一个凭证...`);
       const nextCred = await getNextCredentialAsync();
       if (nextCred) {
         credential = nextCred;
@@ -529,8 +529,8 @@ async function requestWithRetry(
   }
   
   const errorSummary = Array.from(uniqueErrors.entries())
-    .map(([code, msg]) => `[${code}] ${msg.substring(0, 100)}`)
-    .join('; ');
+    .map(([code, msg]) => `[${code}] ${msg}`)
+    .join('\n');
   
   throw new Error(`所有 ${totalCredentials} 个凭证均请求失败 (模型: ${modelName})。错误汇总: ${errorSummary || '未知错误'}`);
 }

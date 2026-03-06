@@ -1,6 +1,7 @@
 import { Provider } from '../provider.js';
 import { Backend } from '../backend.js';
 import { getBackend } from '../backend-factory.js';
+import { countRequestInputTokens } from '../token-counter.js';
 import {
   convertMessagesToContents,
   convertToGeminiConfig,
@@ -158,6 +159,16 @@ export class GeminiProvider implements Provider {
     }
 
     return convertStream();
+  }
+
+  async countTokens(model: string, request: any): Promise<{ input_tokens: number; total_tokens: number; estimated: boolean }> {
+    const processedRequest = applyPayloadConfig(model, 'openai', request);
+    const total = countRequestInputTokens(processedRequest);
+    return {
+      input_tokens: total,
+      total_tokens: total,
+      estimated: true,
+    };
   }
 
   isModelSupported(model: string): boolean {

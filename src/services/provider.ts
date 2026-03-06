@@ -3,6 +3,12 @@
  * All providers accept OpenAI-format requests and return OpenAI-shaped responses.
  * This abstracts away the differences between Gemini, Codex, iFlow, etc.
  */
+export interface CountTokensResult {
+  input_tokens: number;
+  total_tokens: number;
+  estimated?: boolean;
+}
+
 export interface Provider {
   readonly name: string;
 
@@ -17,6 +23,12 @@ export interface Provider {
    * Yields OpenAI-shaped chunks: { id, object, choices: [{ delta, ... }] }
    */
   chatCompletionStream(model: string, request: any): Promise<AsyncIterable<any>>;
+
+  /**
+   * Count input tokens for a request.
+   * Returns a provider-agnostic token count shape.
+   */
+  countTokens(model: string, request: any): Promise<CountTokensResult>;
 
   isModelSupported(model: string): boolean;
 }

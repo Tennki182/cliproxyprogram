@@ -38,6 +38,22 @@ export function logReq(msg: string, meta?: Record<string, unknown>): void {
   push({ ts: Date.now(), level: 'req', msg, meta });
 }
 
+export function formatErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message || error.toString();
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message.length > 0) {
+      return message;
+    }
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
 export function getRecentLogs(): LogEntry[] {
   return [...buffer];
 }

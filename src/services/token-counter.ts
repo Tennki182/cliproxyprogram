@@ -116,11 +116,18 @@ export function countToolsTokens(tools: any[]): number {
 }
 
 /**
+ * Count input tokens for a request without estimating any output tokens.
+ */
+export function countRequestInputTokens(request: any): number {
+  return countMessagesTokens(request?.messages || [])
+    + countToolsTokens(request?.tools || []);
+}
+
+/**
  * Calculate token count for a complete request
  */
 export function calculateRequestTokens(request: any): TokenCountResult {
-  const promptTokens = countMessagesTokens(request.messages || []) 
-    + countToolsTokens(request.tools || []);
+  const promptTokens = countRequestInputTokens(request);
   
   // Estimate completion tokens based on max_tokens or default
   const completionTokens = request.max_tokens || 1000;
